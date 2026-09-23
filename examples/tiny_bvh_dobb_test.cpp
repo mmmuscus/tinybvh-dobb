@@ -157,14 +157,24 @@ void Init() {
 
 	// load camera position / direction from file
 	std::fstream t = std::fstream{ "camera.bin", t.binary | t.in };
-	if (!t.is_open()) return;
-	t.read((char*)&eye, sizeof(eye));
-	t.read((char*)&view, sizeof(view));
-	t.close();
+	if (!t.is_open()) {
+		t.read((char*)&eye, sizeof(eye));
+		t.read((char*)&view, sizeof(view));
+		t.close();
+	}
+
+	// Update camera vector once
+	bvhvec3 right = tinybvh_normalize(tinybvh_cross(bvhvec3(0, 1, 0), view));
+	bvhvec3 up = 0.8f * tinybvh_cross(view, right);
+	bvhvec3 C = eye + 1.2f * view;
+	p1 = C - right + up;   // top-left
+	p2 = C + right + up;   // top-right
+	p3 = C - right - up;   // bottom-left
 }
 
 void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 {
+	frameIdx++;
 	// render tiles
 	const float scale = 1.0f / spp++;
 	tileIdx = threadCount;
