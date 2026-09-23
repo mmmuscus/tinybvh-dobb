@@ -157,7 +157,7 @@ void Init() {
 
 	// load camera position / direction from file
 	std::fstream t = std::fstream{ "camera.bin", t.binary | t.in };
-	if (!t.is_open()) {
+	if (t.is_open()) {
 		t.read((char*)&eye, sizeof(eye));
 		t.read((char*)&view, sizeof(view));
 		t.close();
