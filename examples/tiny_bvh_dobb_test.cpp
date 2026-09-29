@@ -13,7 +13,10 @@ using namespace tinybvh;
 #include <cstdio>
 
 // Application variables
+static BVH bvh, static float bvhCost = 0.0f;
 static BVH baseBvh;
+// TODO: replace with actual SOBB class
+static BVH dobbBvh;
 static bvhvec4* tris = 0;
 static int triCount = 0, frameIdx = 0, spp = 0;
 static bvhvec3 accumulator[SCRWIDTH * SCRHEIGHT];
@@ -137,23 +140,29 @@ void AddMesh(const char* file, float scale = 1, bvhvec3 pos = {}, int c = 0, int
 }
 
 // Load meshes we want to test with dobb bvh
-void LoadMeshData() 
+void LoadMeshDatas() 
 {
 	AddMesh("./testdata/cryteksponza.bin", 1, bvhvec3(0), 0xffffff);
 }
 
 // ---------------------- BUILD BVH ----------------------
 
-void BuildBvh() 
+// Build BVHs and then set their c_trav and c_int values to 1.0
+// to measure BVH quality
+void InitBvhs() 
 {
 	baseBvh.Build(tris, triCount);
+	baseBvh.c_trav = 1.0, baseBvh.c_int = 1.0;
+	// TODO: replace w actual dobb class
+	dobbBvh.BuildHQ(tris, triCount);
+	dobbBvh.c_trav = 1.0, dobbBvh.c_int = 1.0;
 }
 
 // ---------------------- MISC ----------------------
 
 void Init() {
-	LoadMeshData();
-	BuildBvh();
+	LoadMeshDatas();
+	InitBvhs();
 
 	// load camera position / direction from file
 	std::fstream t = std::fstream{ "camera.bin", t.binary | t.in };
