@@ -27,16 +27,17 @@ static const char* meshLocations[2] = {
 };
 static const int meshCount = sizeof(meshLocations) / sizeof(meshLocations[0]);
 static int meshIdx = 0;
-static float baseRenderStart, dobbRenderStart;
+static float renderStart;
+static float renderTime = 0.0f;
 static float renderLength = 5.0f;
 
 // Application variables
-static BVH bvh, static float bvhCost = 0.0f;
+static float cost = 0.0f;
 static BVH baseBvh;
 // TODO: replace with actual SOBB class
 static BVH dobbBvh;
 static bvhvec4* tris = 0;
-static int triCount = 0, frameIdx = 0, spp = 0;
+static int triCount = 0, spp = 0;
 static bvhvec3 accumulator[SCRWIDTH * SCRHEIGHT];
 static std::atomic<int> tileIdx(0);
 
@@ -124,7 +125,7 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 	while (tile < tiles)
 	{
 		const int tx = tile % xtiles, ty = tile / xtiles;
-		unsigned seed = (tile + 17) * 171717 + frameIdx * 1023;
+		unsigned seed = (tile + 17) * 171717 + spp * 1023;
 		for (int y = 0; y < TILESIZE; y++) for (int x = 0; x < TILESIZE; x++)
 		{
 			const int pixel_x = tx * TILESIZE + x, pixel_y = ty * TILESIZE + y;
@@ -170,12 +171,6 @@ void ClearMesh()
 	triCount = 0;
 }
 
-// Load meshes we want to test with dobb bvh
-void LoadMeshDatas() 
-{
-	AddMesh("./testdata/cryteksponza.bin", 1, bvhvec3(0), 0xffffff);
-}
-
 // ---------------------- BUILD BVH ----------------------
 
 // Build BVHs and then set their c_trav and c_int values to 1.0
@@ -192,9 +187,6 @@ void InitBvhs()
 // ---------------------- MISC ----------------------
 
 void Init() {
-	LoadMeshDatas();
-	InitBvhs();
-
 	// load camera position / direction from file
 	std::fstream t = std::fstream{ "camera.bin", t.binary | t.in };
 	if (t.is_open()) {
@@ -212,6 +204,29 @@ void Init() {
 	p3 = C - right - up;   // bottom-left
 }
 
+template <class BVHType>
+void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* buf)
+{
+	if (spp > 0) renderTime += delta_time_s;
+	// render tiles
+	const float scale = 1.0f / ++spp;
+	tileIdx = threadCount;
+	std::vector<std::thread> threads;
+	for (uint32_t i = 0; i < threadCount; i++)
+		threads.emplace_back(TraceWorkerThread<BVHType>, std::cref(bvh), buf, scale, i);
+	for (auto& thread : threads) thread.join();
+	// print frame time / rate in window title
+	char title[50];
+	snprintf(title, sizeof(title), "tiny_bvh %.2f s %.2f Hz", delta_time_s, 1.0f / delta_time_s);
+	fenster_update_title(&f, title);
+}
+
+void resetRender() {
+	memset(accumulator, 0, sizeof(accumulator));
+	spp = 0;
+	renderStart = renderTime;
+}
+
 void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 {
 	switch (phase) {
@@ -227,46 +242,29 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			
 			// Swap to the next phase
 			phase = RENDERBASE;
-			baseRenderStart = delta_time_s;
+			resetRender();
 			break;
 		case RENDERBASE:
 			RenderTick(baseBvh, delta_time_s, f, buf);
-			if (delta_time_s - baseRenderStart >= renderLength)
+			if (renderTime - renderStart >= renderLength)
 			{
 				phase = RENDERDOBB;
-				dobbRenderStart = delta_time_s;
+				resetRender();
 			}
 			break;
 
 		case RENDERDOBB:
-			RenderTick(baseBvh, delta_time_s, f, buf);
-			if (delta_time_s - baseRenderStart >= renderLength)
+			RenderTick(dobbBvh, delta_time_s, f, buf);
+			if (renderTime - renderStart >= renderLength)
 			{
 				phase = BUILD;
 				meshIdx++;
-				if (meshIdx > meshCount) phase = END;
+				if (meshIdx >= meshCount) phase = END;
 			}
 			break;
 		case END: break;
 		default: break;
 	}
-}
-
-template <class BVHType>
-void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* buf)
-{
-	frameIdx++;
-	// render tiles
-	const float scale = 1.0f / spp++;
-	tileIdx = threadCount;
-	std::vector<std::thread> threads;
-	for (uint32_t i = 0; i < threadCount; i++)
-		threads.emplace_back(&TraceWorkerThread, bvh, buf, scale, i);
-	for (auto& thread : threads) thread.join();
-	// print frame time / rate in window title
-	char title[50];
-	snprintf(title, sizeof(title), "tiny_bvh %.2f s %.2f Hz", delta_time_s, 1.0f / delta_time_s);
-	fenster_update_title(&f, title);
 }
 
 // Application Shutdown
