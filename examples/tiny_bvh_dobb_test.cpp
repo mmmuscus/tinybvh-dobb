@@ -12,6 +12,24 @@ using namespace tinybvh;
 #include <cstdlib>
 #include <cstdio>
 
+enum Phase {
+	BUILD,
+	RENDERBASE,
+	RENDERDOBB,
+	END
+};
+
+// Helpers for experimental setup
+static Phase phase = BUILD;
+static const char* meshLocations[2] = {
+	"./testdata/cryteksponza.bin",
+	"./testdata/dragon.bin"
+};
+static const int meshCount = sizeof(meshLocations) / sizeof(meshLocations[0]);
+static int meshIdx = 0;
+static float baseRenderStart, dobbRenderStart;
+static float renderLength = 5.0f;
+
 // Application variables
 static BVH bvh, static float bvhCost = 0.0f;
 static BVH baseBvh;
@@ -66,7 +84,8 @@ bvhvec3 TriangleNormal(const unsigned idx)
 }
 
 // Light transport calculation - Basic recursive Path Tracer with IS and Next Event Estimation
-bvhvec3 Trace(BVH& bvh, Ray ray, unsigned& seed, unsigned depth = 0)
+template <class BVHType>
+bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, unsigned depth = 0)
 {
 	// find primary intersection
 	bvh.Intersect(ray);
@@ -96,7 +115,8 @@ bvhvec3 Trace(BVH& bvh, Ray ray, unsigned& seed, unsigned depth = 0)
 	return direct + indirect;
 }
 
-void TraceWorkerThread(uint32_t* buf, float scale, int threadIdx)
+template <class BVHType>
+void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threadIdx)
 {
 	const int xtiles = SCRWIDTH / TILESIZE, ytiles = SCRHEIGHT / TILESIZE;
 	const int tiles = xtiles * ytiles;
@@ -113,7 +133,7 @@ void TraceWorkerThread(uint32_t* buf, float scale, int threadIdx)
 			const float u = (float)pixel_x / SCRWIDTH, v = (float)pixel_y / SCRHEIGHT;
 			const bvhvec3 D = tinybvh_normalize(p1 + u * (p2 - p1) + v * (p3 - p1) - eye);
 			// trace
-			accumulator[pixelIdx] += Trace(baseBvh, Ray(eye, D), seed);
+			accumulator[pixelIdx] += Trace(bvh, Ray(eye, D), seed);
 			const bvhvec3 E = accumulator[pixelIdx] * scale;
 			// visualize, with a poor man's gamma correct
 			const int r = (int)tinybvh_min(255.0f, sqrtf(E.x) * 255.0f);
@@ -137,6 +157,17 @@ void AddMesh(const char* file, float scale = 1, bvhvec3 pos = {}, int c = 0, int
 	tris = data, s.read((char*)tris + triCount * 48, N * 48), triCount += N;
 	for (int* b = (int*)tris + (triCount - N) * 12, i = 0; i < N * 3; i++)
 		*(bvhvec3*)b = *(bvhvec3*)b * scale + pos, b[3] = c ? c : b[3], b += 4;
+}
+
+void ClearMesh()
+{
+	if (tris)
+	{
+		free64(tris);
+		tris = 0;
+	}
+
+	triCount = 0;
 }
 
 // Load meshes we want to test with dobb bvh
@@ -183,13 +214,54 @@ void Init() {
 
 void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 {
+	switch (phase) {
+		case BUILD:
+			// Reset and load next mesh to be tested
+			ClearMesh();
+			AddMesh(
+				meshLocations[meshIdx], 
+				1, bvhvec3(0), 0xffffff
+			);
+			// Build BVHs 
+			InitBvhs();
+			
+			// Swap to the next phase
+			phase = RENDERBASE;
+			baseRenderStart = delta_time_s;
+			break;
+		case RENDERBASE:
+			RenderTick(baseBvh, delta_time_s, f, buf);
+			if (delta_time_s - baseRenderStart >= renderLength)
+			{
+				phase = RENDERDOBB;
+				dobbRenderStart = delta_time_s;
+			}
+			break;
+
+		case RENDERDOBB:
+			RenderTick(baseBvh, delta_time_s, f, buf);
+			if (delta_time_s - baseRenderStart >= renderLength)
+			{
+				phase = BUILD;
+				meshIdx++;
+				if (meshIdx > meshCount) phase = END;
+			}
+			break;
+		case END: break;
+		default: break;
+	}
+}
+
+template <class BVHType>
+void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* buf)
+{
 	frameIdx++;
 	// render tiles
 	const float scale = 1.0f / spp++;
 	tileIdx = threadCount;
 	std::vector<std::thread> threads;
 	for (uint32_t i = 0; i < threadCount; i++)
-		threads.emplace_back(&TraceWorkerThread, buf, scale, i);
+		threads.emplace_back(&TraceWorkerThread, bvh, buf, scale, i);
 	for (auto& thread : threads) thread.join();
 	// print frame time / rate in window title
 	char title[50];
