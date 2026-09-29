@@ -12,6 +12,11 @@ using namespace tinybvh;
 #include <cstdlib>
 #include <cstdio>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <iostream>
+
 enum Phase {
 	BUILD,
 	RENDERBASE,
@@ -89,7 +94,7 @@ template <class BVHType>
 bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, unsigned depth = 0)
 {
 	// find primary intersection
-	bvh.Intersect(ray);
+	cost += bvh.Intersect(ray);
 	// shade
 	if (ray.hit.t == 1e30f) return bvhvec3(0.6f, 0.7f, 1); // hit nothing
 	bvhvec3 I = ray.O + ray.hit.t * ray.D;
@@ -187,6 +192,14 @@ void InitBvhs()
 // ---------------------- MISC ----------------------
 
 void Init() {
+#ifdef _WIN32
+	AllocConsole();
+	FILE* dummy;
+	freopen_s(&dummy, "CONOUT$", "w", stdout);
+	freopen_s(&dummy, "CONOUT$", "w", stderr);
+	std::cout.clear();
+	std::cerr.clear();
+#endif
 	// load camera position / direction from file
 	std::fstream t = std::fstream{ "camera.bin", t.binary | t.in };
 	if (t.is_open()) {
@@ -217,13 +230,19 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 	for (auto& thread : threads) thread.join();
 	// print frame time / rate in window title
 	char title[50];
-	snprintf(title, sizeof(title), "tiny_bvh %.2f s %.2f Hz", delta_time_s, 1.0f / delta_time_s);
+	snprintf(
+		title, sizeof(title), 
+		"tiny_bvh %.2f s %.2f Hz", 
+		delta_time_s, 
+		1.0f / delta_time_s
+	);
 	fenster_update_title(&f, title);
 }
 
 void resetRender() {
 	memset(accumulator, 0, sizeof(accumulator));
 	spp = 0;
+	cost = 0.0f;
 	renderStart = renderTime;
 }
 
@@ -248,6 +267,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			RenderTick(baseBvh, delta_time_s, f, buf);
 			if (renderTime - renderStart >= renderLength)
 			{
+				std::cout << cost << std::endl;
 				phase = RENDERDOBB;
 				resetRender();
 			}
@@ -257,9 +277,14 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			RenderTick(dobbBvh, delta_time_s, f, buf);
 			if (renderTime - renderStart >= renderLength)
 			{
+				std::cout << cost << std::endl;
 				phase = BUILD;
 				meshIdx++;
-				if (meshIdx >= meshCount) phase = END;
+				if (meshIdx >= meshCount) 
+				{
+					phase = END;
+					std::cout << "END" << std::endl;
+				}
 			}
 			break;
 		case END: break;
@@ -275,4 +300,7 @@ void Shutdown()
 	s.write((char*)&eye, sizeof(eye));
 	s.write((char*)&view, sizeof(view));
 	s.close();
+#ifdef _WIN32
+	FreeConsole();
+#endif
 }
