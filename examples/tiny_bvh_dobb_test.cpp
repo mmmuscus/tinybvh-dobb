@@ -26,9 +26,13 @@ enum Phase {
 
 // Helpers for experimental setup
 static Phase phase = BUILD;
+// TODO: organize into single array of structures
 static const char* meshLocations[2] = {
 	"./testdata/cryteksponza.bin",
 	"./testdata/dragon.bin"
+};
+static const char* meshNames[2] = {
+	"CRYTEKSPONZA", "DRAGON"
 };
 static const int meshCount = sizeof(meshLocations) / sizeof(meshLocations[0]);
 static int meshIdx = 0;
@@ -232,9 +236,8 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 	char title[50];
 	snprintf(
 		title, sizeof(title), 
-		"tiny_bvh %.2f s %.2f Hz", 
-		delta_time_s, 
-		1.0f / delta_time_s
+		"tiny_bvh %s, spp: %d, time: %f s", 
+		meshNames[meshIdx], spp, renderTime - renderStart
 	);
 	fenster_update_title(&f, title);
 }
@@ -267,7 +270,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			RenderTick(baseBvh, delta_time_s, f, buf);
 			if (renderTime - renderStart >= renderLength)
 			{
-				std::cout << cost << std::endl;
+				std::cout << "Base BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost << std::endl;
 				phase = RENDERDOBB;
 				resetRender();
 			}
@@ -277,7 +280,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			RenderTick(dobbBvh, delta_time_s, f, buf);
 			if (renderTime - renderStart >= renderLength)
 			{
-				std::cout << cost << std::endl;
+				std::cout << "DOBB BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost << std::endl;
 				phase = BUILD;
 				meshIdx++;
 				if (meshIdx >= meshCount) 
