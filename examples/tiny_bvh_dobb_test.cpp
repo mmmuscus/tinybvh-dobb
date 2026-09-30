@@ -38,10 +38,10 @@ static const int meshCount = sizeof(meshLocations) / sizeof(meshLocations[0]);
 static int meshIdx = 0;
 static float renderStart;
 static float renderTime = 0.0f;
-static float renderLength = 5.0f;
+static float renderLength = 20.0f;
 
 // Application variables
-static float cost = 0.0f;
+static uint64_t cost = 0;
 static BVH baseBvh;
 // TODO: replace with actual SOBB class
 static BVH dobbBvh;
@@ -95,12 +95,16 @@ bvhvec3 TriangleNormal(const unsigned idx)
 
 // Light transport calculation - Basic recursive Path Tracer with IS and Next Event Estimation
 template <class BVHType>
-bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, unsigned depth = 0)
+bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost, unsigned depth = 0)
 {
 	// find primary intersection
-	cost += bvh.Intersect(ray);
+	int localCost = bvh.Intersect(ray);
+	traceCost += localCost;
+	bvhvec3 localCostVec = bvhvec3((float)localCost / 3000.0f, 0.0f, 0.0f);
 	// shade
-	if (ray.hit.t == 1e30f) return bvhvec3(0.6f, 0.7f, 1); // hit nothing
+	if (ray.hit.t == 1e30f)
+		return localCostVec;
+		// return bvhvec3(0.6f, 0.7f, 1); // hit nothing
 	bvhvec3 I = ray.O + ray.hit.t * ray.D;
 	bvhvec3 N = TriangleNormal(ray.hit.prim);
 	if (tinybvh_dot(N, ray.D) > 0) N = -N;
@@ -118,16 +122,19 @@ bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, unsigned depth = 0)
 	{
 		bvhvec3 R = CosWeightedDiffReflection(N, seed);
 		float pdf = 1.0f / tinybvh_dot(N, R);
-		bvhvec3 irradiance = Trace(bvh, Ray(I + R * 0.001f, R), seed, depth + 1);
-		indirect = BRDF * irradiance * (1.0f / pdf);
+		bvhvec3 irradiance = Trace(bvh, Ray(I + R * 0.001f, R), seed, traceCost, depth + 1);
+		localCostVec += irradiance;
+		// indirect = BRDF * irradiance * (1.0f / pdf);
 	}
 	// finalize
-	return direct + indirect;
+	// return direct + indirect;
+	return localCostVec;
 }
 
 template <class BVHType>
 void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threadIdx)
 {
+	uint64_t localCost = 0;
 	const int xtiles = SCRWIDTH / TILESIZE, ytiles = SCRHEIGHT / TILESIZE;
 	const int tiles = xtiles * ytiles;
 	int tile = threadIdx;
@@ -143,7 +150,7 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 			const float u = (float)pixel_x / SCRWIDTH, v = (float)pixel_y / SCRHEIGHT;
 			const bvhvec3 D = tinybvh_normalize(p1 + u * (p2 - p1) + v * (p3 - p1) - eye);
 			// trace
-			accumulator[pixelIdx] += Trace(bvh, Ray(eye, D), seed);
+			accumulator[pixelIdx] += Trace(bvh, Ray(eye, D), seed, localCost);
 			const bvhvec3 E = accumulator[pixelIdx] * scale;
 			// visualize, with a poor man's gamma correct
 			const int r = (int)tinybvh_min(255.0f, sqrtf(E.x) * 255.0f);
@@ -153,6 +160,7 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 		}
 		tile = tileIdx++;
 	}
+	cost += localCost;
 }
 
 // ---------------------- LOAD DATA ----------------------
@@ -245,7 +253,7 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 void resetRender() {
 	memset(accumulator, 0, sizeof(accumulator));
 	spp = 0;
-	cost = 0.0f;
+	cost = 0;
 	renderStart = renderTime;
 }
 
@@ -254,11 +262,13 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 	switch (phase) {
 		case BUILD:
 			// Reset and load next mesh to be tested
+			std::cout << "Loading mesh: " << meshNames[meshIdx] << std::endl;
 			ClearMesh();
 			AddMesh(
 				meshLocations[meshIdx], 
 				1, bvhvec3(0), 0xffffff
 			);
+			std::cout << "Building BVHs" << std::endl;
 			// Build BVHs 
 			InitBvhs();
 			
@@ -270,7 +280,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			RenderTick(baseBvh, delta_time_s, f, buf);
 			if (renderTime - renderStart >= renderLength)
 			{
-				std::cout << "Base BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost << std::endl;
+				std::cout << "Base BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost / spp << std::endl;
 				phase = RENDERDOBB;
 				resetRender();
 			}
@@ -280,7 +290,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			RenderTick(dobbBvh, delta_time_s, f, buf);
 			if (renderTime - renderStart >= renderLength)
 			{
-				std::cout << "DOBB BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost << std::endl;
+				std::cout << "DOBB BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost / spp << std::endl;
 				phase = BUILD;
 				meshIdx++;
 				if (meshIdx >= meshCount) 
