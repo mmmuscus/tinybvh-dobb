@@ -6,6 +6,8 @@
 
 #define TINYBVH_IMPLEMENTATION
 #include "tiny_bvh.h"
+#define TINYBVH_DOBB_IMPLEMENTATION
+#include "tiny_bvh_dobb.h"
 using namespace tinybvh;
 
 // Other includes
