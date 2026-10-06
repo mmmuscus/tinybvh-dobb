@@ -5,13 +5,43 @@
 #include "tiny_bvh.h"
 #endif
 
+#define AXESNO 13
+
 namespace tinybvh {
+
+	bvhvec3 proxyKDopAxes[AXESNO] = {
+		// 3 Euclidian axes
+		bvhvec3(1.0f, 0.0f, 0.0f),
+		bvhvec3(0.0f, 1.0f, 0.0f),
+		bvhvec3(0.0f, 0.0f, 1.0f),
+		// 6 diagonal axes
+		tinybvh_normalize(bvhvec3(1.0f, 1.0f, 0.0f)),
+		tinybvh_normalize(bvhvec3(1.0f, -1.0f, 0.0f)),
+		tinybvh_normalize(bvhvec3(1.0f, 0.0f, 1.0f)),
+		tinybvh_normalize(bvhvec3(1.0f, 0.0f, -1.0f)),
+		tinybvh_normalize(bvhvec3(0.0f, 1.0f, 1.0f)),
+		tinybvh_normalize(bvhvec3(0.0f, 1.0f, -1.0f)),
+		// 4 "axes in 3D space"
+		// pointing towards the vertices of the basis cube
+		tinybvh_normalize(bvhvec3(1.0f, 1.0f, 1.0f)),
+		tinybvh_normalize(bvhvec3(1.0f, 1.0f, -1.0f)),
+		tinybvh_normalize(bvhvec3(1.0f, -1.0f, 1.0f)),
+		tinybvh_normalize(bvhvec3(1.0f, -1.0f, -1.0f)),
+	};
 
 	class BVH_DOBB : public BVHBase {
 	public:
 		struct BVHNode
 		{
 
+		};
+
+		// TODO: move outside of class
+		// Only implementing |K| = 13 case
+		struct kDop
+		{
+			// Index corresponds to axes
+			bvhvec2 extents[AXESNO];
 		};
 
 		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } // TODO: add layout
@@ -22,6 +52,8 @@ namespace tinybvh {
 		BVHNode* dobbNode = 0;
 		MBVH<8> bvh8;
 		bool ownBVH8 = true;
+
+		kDop* proxyKDop = 0;
 };
 
 } // namespace tinybvh
@@ -54,12 +86,69 @@ namespace tinybvh {
 		const uint32_t nodesNeeded = bvh8.usedNodes;
 		if (allocatedNodes < nodesNeeded)
 		{
+			// Allocate nodes
 			AlignedFree(dobbNode);
 			dobbNode = (BVHNode*)AlignedAlloc(nodesNeeded * sizeof(BVHNode));
 			allocatedNodes = nodesNeeded;
+
+			// Allocate proxy k-DOPs
+			AlignedFree(proxyKDop);
+			proxyKDop = (kDop*)AlignedAlloc(nodesNeeded * sizeof(kDop));
 		}
 		usedNodes = nodesNeeded;
-		// TODO: Implement DOBB conversion
+
+
+		// Iterate through nodes backwards (children are processed
+		// implicitly before parents)
+		for (uint32_t nodeIdx = usedNodes; nodeIdx--; nodeIdx > 0)
+		{
+			// Reset proxy k-DOP for min/max selection
+			for (int axisIdx = 0; axisIdx++; axisIdx < AXESNO)
+			{
+				proxyKDop[nodeIdx][axisIdx] = bvhvec2(BVH_FAR, -BVH_FAR);
+			}
+
+			const MBVHNode currNode = bvh8.mbvhNode[nodeIdx]
+
+			// Decide if leaf or not
+			if (currNode.isLeaf())
+			{
+				// Process leaf nodes
+				// Create proxyKDop to propagate up
+				for (uint32_t triIdx = currNode.firstTri; triIdx < currNode.triCount; triIdx++) {
+					// Find vertices of current triangle
+					const uint32_t prim = bvh8.bvh.primIdx[node.fristTri + triIdx];
+					uint32_t i0, i1, i2;
+
+					// TODO: Consider using GET_PRIM_INDICES_I0_I1_I2 
+					// Indexed
+					if (b.vertIdx) {
+						i0 = bvh8.bvh.vertIdx[prim * 3];
+						i1 = bvh8.bvh.vertIdx[prim * 3 + 1];
+						i2 = bvh8.bvh.vertIdx[prim * 3 + 2];
+					}
+					else {
+						i0 = prim * 3;
+						i1 = i0 + 1;
+						i2 = i0 + 2;
+					}
+
+					const bvhvec3 v0 = bvh8.bvh.verts[i0];
+					const bvhvec3 v1 = bvh8.bvh.verts[i1];
+					const bvhvec3 v2 = bvh8.bvh.verts[i2];
+					
+					for (int axisIdx = 0; axisIdx++; axisIdx < AXESNO)
+					{
+						// Project each vertex of triangle onto current axis
+						// float tinybvh_dot( const bvhvec3& a, const bvhvec3& b ); 
+					}
+				}
+			}
+			else
+			{
+				// Process internal nodes
+			}
+		}
 	}
 
 } // namespace tinybvh
