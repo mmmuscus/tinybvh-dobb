@@ -274,38 +274,16 @@ namespace tinybvh {
 					}
 				}
 
-				// Create proxyKDop to propagate up
-				for (uint32_t triIdx = 0; triIdx < currNode.triCount; triIdx++) {
-					// Find vertices of current triangle
-					const uint32_t prim = bvh8.bvh.primIdx[currNode.firstTri + triIdx];
-					uint32_t i0, i1, i2;
-					GET_PRIM_INDICES_I0_I1_I2(bvh8.bvh, prim);
-
-					const bvhvec3 v0 = bvh8.bvh.verts[i0];
-					const bvhvec3 v1 = bvh8.bvh.verts[i1];
-					const bvhvec3 v2 = bvh8.bvh.verts[i2];
-					
-					for (int axisIdx = 0; axisIdx < AXESNO; axisIdx++)
-					{
-						// Project each vertex of triangle onto current axis
-						// float tinybvh_dot( const bvhvec3& a, const bvhvec3& b ); 
-						float v0Extent = tinybvh_dot(proxyKDopAxes[axisIdx], v0);
-						float v1Extent = tinybvh_dot(proxyKDopAxes[axisIdx], v1);
-						float v2Extent = tinybvh_dot(proxyKDopAxes[axisIdx], v2);
-
+				// Create proxy KDop to propagate up
+				for (uint32_t vertIdx = 0; vertIdx < noLeafVerts; vertIdx++) {
+					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) {
 						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
-							v0Extent, proxyKDop[nodeIdx].extents[axisIdx].x);
-						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
-							v1Extent, proxyKDop[nodeIdx].extents[axisIdx].x);
-						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
-							v2Extent, proxyKDop[nodeIdx].extents[axisIdx].x);
+							tinybvh_dot(proxyKDopAxes[axisIdx], leafVerts[vertIdx]),
+							proxyKDop[nodeIdx].extents[axisIdx].x);
 
 						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
-							v0Extent, proxyKDop[nodeIdx].extents[axisIdx].y);
-						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
-							v1Extent, proxyKDop[nodeIdx].extents[axisIdx].y);
-						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
-							v2Extent, proxyKDop[nodeIdx].extents[axisIdx].y);
+							tinybvh_dot(proxyKDopAxes[axisIdx], leafVerts[vertIdx]),
+							proxyKDop[nodeIdx].extents[axisIdx].y);
 					}
 				}
 			}
