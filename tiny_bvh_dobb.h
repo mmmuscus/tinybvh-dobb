@@ -6,9 +6,9 @@
 #endif
 
 #define AXESNO 13
+#define SMALLM 4
 
 namespace tinybvh {
-
 	static const bvhvec3 proxyKDopAxes[AXESNO] = {
 		// 3 Euclidian axes
 		bvhvec3(1.0f, 0.0f, 0.0f),
@@ -27,6 +27,54 @@ namespace tinybvh {
 		tinybvh_normalize(bvhvec3(1.0f, 1.0f, -1.0f)),
 		tinybvh_normalize(bvhvec3(1.0f, -1.0f, 1.0f)),
 		tinybvh_normalize(bvhvec3(1.0f, -1.0f, -1.0f)),
+	};
+
+	// TODO: indirection of LUT
+	class DOBB_LUT {
+	public: 
+		struct Mat3 { float m[3][3]; };
+
+		Mat3 rotations[AXESNO * SMALLM * 2];
+
+		DOBB_LUT() { buildLUT(); }
+
+	private:
+		// https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
+		// axis must be normalized
+		static Mat3 rodriguesRotMat(bvhvec3 axis, float angle) {
+			const float cs = cosf(angle);
+			const float oneMinusCos = 1 - cs;
+			const float sn = sinf(angle);
+			Mat3 ret;
+
+			ret.m[0][0] = cs + oneMinusCos * axis.x * axis.x;
+			ret.m[0][1] = oneMinusCos * axis.x * axis.y - sn * axis.z;
+			ret.m[0][2] = oneMinusCos * axis.x * axis.z + sn * axis.y;
+
+			ret.m[1][0] = oneMinusCos * axis.x * axis.y + sn * axis.z;
+			ret.m[1][1] = cs + oneMinusCos * axis.y * axis.y;
+			ret.m[1][2] = oneMinusCos * axis.y * axis.z - sn * axis.x;
+
+			ret.m[2][0] = oneMinusCos * axis.x * axis.z - sn * axis.y;
+			ret.m[2][1] = oneMinusCos * axis.y * axis.z + sn * axis.x;
+			ret.m[2][2] = cs + oneMinusCos * axis.z * axis.z;
+
+			return ret;
+		}
+
+		void buildLUT() {
+			const float delta = 3.14159265358979f / (2.0f * SMALLM);
+			uint32_t rotationsIdx = 0;
+
+			for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) 
+				for (int i = 1; i <= SMALLM; i++) {
+					rotations[rotationsIdx++] = rodriguesRotMat(
+						proxyKDopAxes[axisIdx], i * delta);
+
+					rotations[rotationsIdx++] = rodriguesRotMat(
+						proxyKDopAxes[axisIdx], i * -delta);
+				}
+		}
 	};
 
 	class BVH_DOBB : public BVHBase {
@@ -54,6 +102,7 @@ namespace tinybvh {
 		bool ownBVH8 = true;
 
 		kDop* proxyKDop = 0;
+		DOBB_LUT lut;
 };
 
 } // namespace tinybvh
@@ -99,6 +148,8 @@ namespace tinybvh {
 		}
 		usedNodes = nodesNeeded;
 
+		// Generate LUT
+		lut = DOBB_LUT();
 
 		// Iterate through nodes backwards (children are processed
 		// implicitly before parents)
@@ -122,7 +173,7 @@ namespace tinybvh {
 				uint32_t i0, i1, i2;
 
 				// For determining B;
-				bvhvec3 a0, a1;
+				bvhvec3 a0, a1, a2;
 
 				if (currNode.triCount == 1) {
 					noLeafVerts = 3;
@@ -273,6 +324,11 @@ namespace tinybvh {
 						a1 = leafVerts[3] - leafVerts[1];
 					}
 				}
+
+				// Calculate B
+				a0 = tinybvh_normalize(a0);
+				a2 = tinybvh_normalize(tinybvh_cross(a0, a1));
+				a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
 
 				// Create proxy KDop to propagate up
 				for (uint32_t vertIdx = 0; vertIdx < noLeafVerts; vertIdx++) {
