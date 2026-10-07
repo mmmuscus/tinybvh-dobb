@@ -9,7 +9,7 @@
 
 namespace tinybvh {
 
-	bvhvec3 proxyKDopAxes[AXESNO] = {
+	static const bvhvec3 proxyKDopAxes[AXESNO] = {
 		// 3 Euclidian axes
 		bvhvec3(1.0f, 0.0f, 0.0f),
 		bvhvec3(0.0f, 1.0f, 0.0f),
@@ -68,6 +68,8 @@ namespace tinybvh {
 	{
 		if (!ownBVH8) bvh8.ReleaseOwnership();
 		AlignedFree(dobbNode);
+
+		AlignedFree(proxyKDop);
 	}
 
 	void BVH_DOBB::ConvertFrom(const MBVH<8>& original)
@@ -100,29 +102,29 @@ namespace tinybvh {
 
 		// Iterate through nodes backwards (children are processed
 		// implicitly before parents)
-		for (uint32_t nodeIdx = usedNodes; nodeIdx--; nodeIdx > 0)
+		for (int nodeIdx = usedNodes - 1; nodeIdx >= 0; nodeIdx--)
 		{
 			// Reset proxy k-DOP for min/max selection
-			for (int axisIdx = 0; axisIdx++; axisIdx < AXESNO)
+			for (int axisIdx = 0; axisIdx < AXESNO; axisIdx++)
 			{
-				proxyKDop[nodeIdx][axisIdx] = bvhvec2(BVH_FAR, -BVH_FAR);
+				proxyKDop[nodeIdx].extents[axisIdx] = bvhvec2(BVH_FAR, -BVH_FAR);
 			}
 
-			const MBVHNode currNode = bvh8.mbvhNode[nodeIdx]
+			const auto& currNode = bvh8.mbvhNode[nodeIdx];
 
 			// Decide if leaf or not
 			if (currNode.isLeaf())
 			{
 				// Process leaf nodes
 				// Create proxyKDop to propagate up
-				for (uint32_t triIdx = currNode.firstTri; triIdx < currNode.triCount; triIdx++) {
+				for (uint32_t triIdx = 0; triIdx < currNode.triCount; triIdx++) {
 					// Find vertices of current triangle
-					const uint32_t prim = bvh8.bvh.primIdx[node.fristTri + triIdx];
+					const uint32_t prim = bvh8.bvh.primIdx[currNode.firstTri + triIdx];
 					uint32_t i0, i1, i2;
 
 					// TODO: Consider using GET_PRIM_INDICES_I0_I1_I2 
 					// Indexed
-					if (b.vertIdx) {
+					if (bvh8.bvh.vertIdx) {
 						i0 = bvh8.bvh.vertIdx[prim * 3];
 						i1 = bvh8.bvh.vertIdx[prim * 3 + 1];
 						i2 = bvh8.bvh.vertIdx[prim * 3 + 2];
@@ -137,16 +139,47 @@ namespace tinybvh {
 					const bvhvec3 v1 = bvh8.bvh.verts[i1];
 					const bvhvec3 v2 = bvh8.bvh.verts[i2];
 					
-					for (int axisIdx = 0; axisIdx++; axisIdx < AXESNO)
+					for (int axisIdx = 0; axisIdx < AXESNO; axisIdx++)
 					{
 						// Project each vertex of triangle onto current axis
 						// float tinybvh_dot( const bvhvec3& a, const bvhvec3& b ); 
+						float v0Extent = tinybvh_dot(proxyKDopAxes[axisIdx], v0);
+						float v1Extent = tinybvh_dot(proxyKDopAxes[axisIdx], v1);
+						float v2Extent = tinybvh_dot(proxyKDopAxes[axisIdx], v2);
+
+						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
+							v0Extent, proxyKDop[nodeIdx].extents[axisIdx].x);
+						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
+							v1Extent, proxyKDop[nodeIdx].extents[axisIdx].x);
+						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
+							v2Extent, proxyKDop[nodeIdx].extents[axisIdx].x);
+
+						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
+							v0Extent, proxyKDop[nodeIdx].extents[axisIdx].y);
+						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
+							v1Extent, proxyKDop[nodeIdx].extents[axisIdx].y);
+						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
+							v2Extent, proxyKDop[nodeIdx].extents[axisIdx].y);
 					}
 				}
 			}
 			else
 			{
 				// Process internal nodes
+				// Iterate through children
+				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
+				{
+					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++)
+					{
+						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
+							proxyKDop[currNode.child[childIdx]].extents[axisIdx].x,
+							proxyKDop[nodeIdx].extents[axisIdx].x);
+
+						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
+							proxyKDop[currNode.child[childIdx]].extents[axisIdx].y,
+							proxyKDop[nodeIdx].extents[axisIdx].y);
+					}
+				}
 			}
 		}
 	}
