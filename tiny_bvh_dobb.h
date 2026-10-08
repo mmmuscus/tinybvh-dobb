@@ -38,6 +38,32 @@ namespace tinybvh {
 
 		DOBB_LUT() { buildLUT(); }
 
+		const float similarity(const bvhvec3 (&capitalB)[3], const uint32_t rotIdx) {
+			const Mat3 rotMat = rotations[rotIdx];
+			// Using dot product, set up matrix that we can use to compare
+			// all possible permutations of bases
+			Mat3 dotMat;
+
+			for (uint32_t i = 0; i < 3; i++) {
+				const bvhvec3 r(rotMat.m[0][i], rotMat.m[1][i], rotMat.m[2][i]);
+				
+				for (uint32_t j = 0; j < 3; j++)
+					dotMat.m[i][j] = fabsf(tinybvh_dot(r, capitalB[j]));
+			}
+
+			static const int Perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+			float maxSim = 0.0f;
+			for (uint32_t i = 0; i < 6; i++)
+				maxSim = tinybvh_max(
+					maxSim,
+					dotMat.m[0][Perms[i][0]] +
+					dotMat.m[1][Perms[i][1]] +
+					dotMat.m[2][Perms[i][2]]
+				);
+
+			return maxSim;
+		}
+
 	private:
 		// https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
 		// axis must be normalized
@@ -81,7 +107,7 @@ namespace tinybvh {
 	public:
 		struct BVHNode
 		{
-
+			uint8_t rotation;
 		};
 
 		// TODO: move outside of class
@@ -329,6 +355,19 @@ namespace tinybvh {
 				a0 = tinybvh_normalize(a0);
 				a2 = tinybvh_normalize(tinybvh_cross(a0, a1));
 				a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
+				
+				// TODO: Implement axis azimuth version
+				// find best rotation candidate for leaf node with B
+				float bestSim = 0.0f;
+				for (uint8_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) {
+					float sim = lut.similarity({a0, a1, a2}, axisIdx);
+					if (sim > bestSim) {
+						bestSim = sim;
+						dobbNode[nodeIdx].rotation = axisIdx;
+					}
+				}
+
+				// calculate rotated bounding box
 
 				// Create proxy KDop to propagate up
 				for (uint32_t vertIdx = 0; vertIdx < noLeafVerts; vertIdx++) {
@@ -346,7 +385,7 @@ namespace tinybvh {
 			else
 			{
 				// Process internal nodes
-				// Iterate through children
+				// Iterate through children and determine k-DOP extents
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
 				{
 					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++)

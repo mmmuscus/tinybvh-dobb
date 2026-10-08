@@ -45,7 +45,7 @@ static float renderLength = 20.0f;
 // Application variables
 static uint64_t cost = 0;
 static BVH baseBvh;
-// TODO: replace with actual SOBB class
+// TODO: replace with actual DOBB class
 static BVH dobbBvh;
 static bvhvec4* tris = 0;
 static int triCount = 0, spp = 0;
