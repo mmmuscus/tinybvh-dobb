@@ -360,11 +360,11 @@ namespace tinybvh {
 				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
 				float bestSim = 0.0f;
-				for (uint8_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) {
-					float sim = lut.similarity({a0, a1, a2}, axisIdx);
+				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
+					float sim = lut.similarity({a0, a1, a2}, rotationIdx);
 					if (sim > bestSim) {
 						bestSim = sim;
-						dobbNode[nodeIdx].rotation = axisIdx;
+						dobbNode[nodeIdx].rotation = rotationIdx;
 					}
 				}
 
@@ -390,27 +390,29 @@ namespace tinybvh {
 				// Process internal nodes
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
 				{
+					uint32_t currChildIdx = currNode.child[childIdx];
+
 					// Gather extents from euclidean axes from axes collection
-					float a = fabsf(proxyKDop[childIdx].extents[0].x - proxyKDop[childIdx].extents[0].y);
-					float b = fabsf(proxyKDop[childIdx].extents[1].x - proxyKDop[childIdx].extents[1].y);
-					float c = fabsf(proxyKDop[childIdx].extents[2].x - proxyKDop[childIdx].extents[2].y);
+					float a = fabsf(proxyKDop[currChildIdx].extents[0].x - proxyKDop[currChildIdx].extents[0].y);
+					float b = fabsf(proxyKDop[currChildIdx].extents[1].x - proxyKDop[currChildIdx].extents[1].y);
+					float c = fabsf(proxyKDop[currChildIdx].extents[2].x - proxyKDop[currChildIdx].extents[2].y);
 
 					// Select rotation by maxselecting on AABB surface area
 					float childAABBSA = 2.0f * (a * b + b * c + c * a);
 					if (childAABBSA > AABBSAMax) {
 						AABBSAMax = childAABBSA;
-						candidateRotationIdx = dobbNode[childIdx].rotation;
+						candidateRotationIdx = dobbNode[currChildIdx].rotation;
 					}
 
 					// Determine k-DOP extents
 					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++)
 					{
 						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
-							proxyKDop[currNode.child[childIdx]].extents[axisIdx].x,
+							proxyKDop[currChildIdx].extents[axisIdx].x,
 							proxyKDop[nodeIdx].extents[axisIdx].x);
 
 						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
-							proxyKDop[currNode.child[childIdx]].extents[axisIdx].y,
+							proxyKDop[currChildIdx].extents[axisIdx].y,
 							proxyKDop[nodeIdx].extents[axisIdx].y);
 					}
 				}
