@@ -105,6 +105,7 @@ namespace tinybvh {
 
 	class BVH_DOBB : public BVHBase {
 	public:
+		// TODO: do compressed BVHNode
 		struct BVHNode
 		{
 			uint8_t rotation;
@@ -356,7 +357,7 @@ namespace tinybvh {
 				a2 = tinybvh_normalize(tinybvh_cross(a0, a1));
 				a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
 				
-				// TODO: Implement axis azimuth version
+				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
 				float bestSim = 0.0f;
 				for (uint8_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) {
@@ -366,8 +367,6 @@ namespace tinybvh {
 						dobbNode[nodeIdx].rotation = axisIdx;
 					}
 				}
-
-				// calculate rotated bounding box
 
 				// Create proxy KDop to propagate up
 				for (uint32_t vertIdx = 0; vertIdx < noLeafVerts; vertIdx++) {
@@ -384,10 +383,26 @@ namespace tinybvh {
 			}
 			else
 			{
+				float AABBSAMax = 0.0f;
+				uint8_t candidateRotationIdx = 127;	// invalid value
+				float AABBSASum = 0.0f;
+
 				// Process internal nodes
-				// Iterate through children and determine k-DOP extents
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
 				{
+					// Gather extents from euclidean axes from axes collection
+					float a = fabsf(proxyKDop[childIdx].extents[0].x - proxyKDop[childIdx].extents[0].y);
+					float b = fabsf(proxyKDop[childIdx].extents[1].x - proxyKDop[childIdx].extents[1].y);
+					float c = fabsf(proxyKDop[childIdx].extents[2].x - proxyKDop[childIdx].extents[2].y);
+
+					// Select rotation by maxselecting on AABB surface area
+					float childAABBSA = 2.0f * (a * b + b * c + c * a);
+					if (childAABBSA > AABBSAMax) {
+						AABBSAMax = childAABBSA;
+						candidateRotationIdx = dobbNode[childIdx].rotation;
+					}
+
+					// Determine k-DOP extents
 					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++)
 					{
 						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
