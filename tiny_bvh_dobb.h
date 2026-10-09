@@ -129,7 +129,7 @@ namespace tinybvh {
 		bool ownBVH8 = true;
 
 		kDop* proxyKDop = 0;
-		DOBB_LUT lut;
+		static DOBB_LUT lut;
 };
 
 } // namespace tinybvh
@@ -384,7 +384,7 @@ namespace tinybvh {
 			else
 			{
 				float AABBSAMax = 0.0f;
-				uint8_t candidateRotationIdx = 127;	// invalid value
+				uint8_t candidateRotationIdx = 0;
 				float AABBSASum = 0.0f;
 
 				// Process internal nodes
@@ -414,6 +414,43 @@ namespace tinybvh {
 						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
 							proxyKDop[currChildIdx].extents[axisIdx].y,
 							proxyKDop[nodeIdx].extents[axisIdx].y);
+					}
+				}
+
+				DOBB_LUT::Mat3 candidateRotation = lut.rotations[candidateRotationIdx];
+
+				// Collect basis vectors of current rotation
+				bvhvec3 rotatedAxes[6] = {
+					bvhvec3(candidateRotation.m[0][0], candidateRotation.m[1][0], candidateRotation.m[2][0]),
+					bvhvec3(-candidateRotation.m[0][0], -candidateRotation.m[1][0], -candidateRotation.m[2][0]),
+					bvhvec3(candidateRotation.m[0][1], candidateRotation.m[1][1], candidateRotation.m[2][1]),
+					bvhvec3(-candidateRotation.m[0][1], -candidateRotation.m[1][1], -candidateRotation.m[2][1]),
+					bvhvec3(candidateRotation.m[0][2], candidateRotation.m[1][2], candidateRotation.m[2][2]),
+					bvhvec3(-candidateRotation.m[0][2], -candidateRotation.m[1][2], -candidateRotation.m[2][2])
+				};
+
+				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
+				{
+					uint32_t currChildIdx = currNode.child[childIdx];
+
+					// Do reprojection based on the selected rotation
+					for (uint32_t rotatedAxesIdx = 0; rotatedAxesIdx < 6; rotatedAxesIdx++)
+					{
+						bvhvec3 v0, v1, v2; // Normals of selected planes
+						float h0, h1, h2; // Extents of selected planes
+						bvhvec3 apexPoint;
+
+						// Do reprojection for the given axis 
+						// TODO: 2) Test against quadsphere
+						// TODO: Remove unnecessary variable declarations after confirming it works correctly
+						// Determine apex point by finding intersection of three planes
+						// Find vectors colinear with the intersection of pairwise planes
+						bvhvec3 c0 = tinybvh_cross(v1, v2);
+						bvhvec3 c1 = tinybvh_cross(v2, v0);
+						bvhvec3 c2 = tinybvh_cross(v0, v1);
+						apexPoint = (c0 * h0 + c1 * h1 + c2 * h2) / tinybvh_dot(v1, c0);
+						// Determine axis extent by projecting apex point onto the axis
+						float axisExtent = tinybvh_dot(rotatedAxes[rotatedAxesIdx], apexPoint);
 					}
 				}
 			}
