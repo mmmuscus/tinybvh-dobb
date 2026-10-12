@@ -34,9 +34,18 @@ namespace tinybvh {
 	public: 
 		struct Mat3 { float m[3][3]; };
 
-		Mat3 rotations[AXESNO * SMALLM * 2];
+		struct reprojectionEntry {
+			uint8_t axisIdx[3];
+			int sign[3];
+		};
 
-		DOBB_LUT() { buildLUT(); }
+		Mat3 rotations[AXESNO * SMALLM * 2];
+		reprojectionEntry reprojections[AXESNO * SMALLM * 2][6];
+
+		DOBB_LUT() { 
+			buildLUT(); 
+			buildReprojectionLUT();
+		}
 
 		const float similarity(const bvhvec3 (&capitalB)[3], const uint32_t rotIdx) {
 			const Mat3 rotMat = rotations[rotIdx];
@@ -100,6 +109,80 @@ namespace tinybvh {
 					rotations[rotationsIdx++] = rodriguesRotMat(
 						proxyKDopAxes[axisIdx], i * -delta);
 				}
+		}
+
+		void buildReprojectionLUT() {
+			for (uint32_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
+				const Mat3& rotation = rotations[rotationIdx];
+				for (uint32_t candidateRotAxisIdx = 0; candidateRotAxisIdx < 6; candidateRotAxisIdx++) {
+					const bvhvec3 candidateAxis(
+						rotation.m[0][candidateRotAxisIdx],
+						rotation.m[1][candidateRotAxisIdx],
+						rotation.m[2][candidateRotAxisIdx]
+					);
+
+					findQuadSphereTriangle(
+						candidateAxis, 
+						reprojections[rotationIdx][candidateRotAxisIdx * 2]
+					);
+					findQuadSphereTriangle(
+						candidateAxis,
+						reprojections[rotationIdx][candidateRotAxisIdx * 2 + 1]
+					);
+				}
+			}
+		}
+
+		// Each triangle of the quad sphere for out purposes is 
+		// corresponds to a face center,an edge middle point and a 
+		// corner (of the unit cube)
+		void findQuadSphereTriangle(const bvhvec3& direction, reprojectionEntry& ret) {
+			const float components[3] = { direction.x, direction.y, direction.z };
+
+			// Find face center
+			float faceCenter[3] = { 0.0f, 0.0f, 0.0f };
+
+			uint8_t majorAxis = 0;
+			if (fabsf(components[1]) > fabsf(components[majorAxis])) 
+				majorAxis = 1;
+			if (fabsf(components[2]) > fabsf(components[majorAxis]))
+				majorAxis = 2;
+
+			faceCenter[majorAxis] = components[majorAxis] >= 0.0 ? 1.0f : -1.0f;
+
+			// Find cube corner
+			float cubeCorner[3] = { faceCenter[0], faceCenter[1], faceCenter[2] };
+
+			int minorAxisFirst = (majorAxis + 1) % 3;
+			int minorAxisSecond = (majorAxis + 2) % 3;
+			const float minorAxisFirstSign = components[minorAxisFirst] >= 0.0f ? 1.0f : -1.0f;
+			const float minorAxisSecondSign = components[minorAxisSecond] >= 0.0f ? 1.0f : -1.0f;
+			
+			cubeCorner[minorAxisFirst] = minorAxisFirstSign;
+			cubeCorner[minorAxisSecond] = minorAxisSecondSign;
+
+			// Find edge midpoint
+			float edgeMidPoint[3] = { faceCenter[0], faceCenter[1], faceCenter[2] };
+			
+			const bool minorAxisFirstIsLarger = fabsf(components[minorAxisFirst]) >= fabsf(components[minorAxisSecond]);
+			if (minorAxisFirstIsLarger)
+				edgeMidPoint[minorAxisFirst] = minorAxisFirstSign;
+			else
+				edgeMidPoint[minorAxisSecond] = minorAxisSecondSign;
+		}
+
+		void quadSpherePointToProxyAxis(const float quadSpherePoint[3], uint8_t& axisIdx, int& sign) {
+			bvhvec3 quadSpherePointVec = {quadSpherePoint[0], quadSpherePoint[1], quadSpherePoint[2] };
+			quadSpherePointVec = tinybvh_normalize(quadSpherePointVec);
+			
+			for (uint8_t proxyAxisIdx = 0; proxyAxisIdx < AXESNO; proxyAxisIdx++) {
+				float alignment = tinybvh_dot(
+						proxyKDopAxes[proxyAxisIdx],
+						quadSpherePointVec);
+
+				if (alignment > 0.999f) { axisIdx = proxyAxisIdx; sign = 1; return; }
+				if (alignment < -0.999f) { axisIdx = proxyAxisIdx; sign = -1; return; }
+			}
 		}
 	};
 
@@ -449,6 +532,7 @@ namespace tinybvh {
 
 						// Do reprojection for the given axis
 						// TODO: 2) Test against quadsphere
+						
 						// TODO: Remove unnecessary variable declarations after confirming it works correctly
 						// Determine apex point by finding intersection of three planes
 						// Find vectors colinear with the intersection of pairwise planes
@@ -465,16 +549,10 @@ namespace tinybvh {
 					float c = fabsf(rotatedAxesExtents[4] - rotatedAxesExtents[5]);
 					DOBBSASum += 2 * (a * b + a * c + b * c);
 
-					bvhvec3 currMinPoint = bvhvec3(
-						tinybvh_min(rotatedAxesExtents[0], rotatedAxesExtents[1]),
-						tinybvh_min(rotatedAxesExtents[2], rotatedAxesExtents[3]),
-						tinybvh_min(rotatedAxesExtents[4], rotatedAxesExtents[5])
-					);
-
 					minPoint = bvhvec3(
-						tinybvh_min(currMinPoint.x, minPoint.x),
-						tinybvh_min(currMinPoint.y, minPoint.y),
-						tinybvh_min(currMinPoint.z, minPoint.z)
+						tinybvh_min(minPoint.x, tinybvh_min(rotatedAxesExtents[0], rotatedAxesExtents[1])),
+						tinybvh_min(minPoint.y, tinybvh_min(rotatedAxesExtents[2], rotatedAxesExtents[3])),
+						tinybvh_min(minPoint.z, tinybvh_min(rotatedAxesExtents[4], rotatedAxesExtents[5]))
 					);
 				}
 
