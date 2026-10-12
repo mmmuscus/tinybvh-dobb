@@ -445,6 +445,7 @@ namespace tinybvh {
 				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
 				float bestSim = 0.0f;
+				dobbNode[nodeIdx].rotation = 255;
 				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
 					float sim = lut.similarity({a0, a1, a2}, rotationIdx);
 					if (sim > bestSim) {
@@ -529,13 +530,26 @@ namespace tinybvh {
 					// Do reprojection based on the selected rotation
 					for (uint32_t rotatedAxesIdx = 0; rotatedAxesIdx < 6; rotatedAxesIdx++)
 					{
-						bvhvec3 v0, v1, v2; // Normals of selected planes
-						float h0, h1, h2; // Extents of selected planes
 						bvhvec3 apexPoint;
 
 						// Do reprojection for the given axis
-						// TODO: 2) Test against quadsphere
-						
+						// Reprojection entry corresponding to current rotation and axis
+						const DOBB_LUT::reprojectionEntry& reprojection = lut.reprojections[candidateRotationIdx][rotatedAxesIdx];
+						// Normals of selected planes
+						bvhvec3 v0 = proxyKDopAxes[reprojection.axisIdx[0]] * (float)reprojection.sign[0];
+						bvhvec3 v1 = proxyKDopAxes[reprojection.axisIdx[1]] * (float)reprojection.sign[1];
+						bvhvec3 v2 = proxyKDopAxes[reprojection.axisIdx[2]] * (float)reprojection.sign[2];
+						// Extents of selected planesű
+						float h0, h1, h2;
+						if (reprojection.sign[0] == 1)
+							h0 = proxyKDop[currChildIdx].extents[reprojection.axisIdx[0]].y;
+						else h0 = -proxyKDop[currChildIdx].extents[reprojection.axisIdx[0]].x;
+						if (reprojection.sign[1] == 1)
+							h1 = proxyKDop[currChildIdx].extents[reprojection.axisIdx[1]].y;
+						else h1 = -proxyKDop[currChildIdx].extents[reprojection.axisIdx[1]].x;
+						if (reprojection.sign[2] == 1)
+							h2 = proxyKDop[currChildIdx].extents[reprojection.axisIdx[2]].y;
+						else h2 = -proxyKDop[currChildIdx].extents[reprojection.axisIdx[2]].x;
 						// TODO: Remove unnecessary variable declarations after confirming it works correctly
 						// Determine apex point by finding intersection of three planes
 						// Find vectors colinear with the intersection of pairwise planes
