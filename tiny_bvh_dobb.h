@@ -114,7 +114,7 @@ namespace tinybvh {
 		void buildReprojectionLUT() {
 			for (uint32_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
 				const Mat3& rotation = rotations[rotationIdx];
-				for (uint32_t candidateRotAxisIdx = 0; candidateRotAxisIdx < 6; candidateRotAxisIdx++) {
+				for (uint32_t candidateRotAxisIdx = 0; candidateRotAxisIdx < 3; candidateRotAxisIdx++) {
 					const bvhvec3 candidateAxis(
 						rotation.m[0][candidateRotAxisIdx],
 						rotation.m[1][candidateRotAxisIdx],
@@ -126,7 +126,7 @@ namespace tinybvh {
 						reprojections[rotationIdx][candidateRotAxisIdx * 2]
 					);
 					findQuadSphereTriangle(
-						candidateAxis,
+						-candidateAxis,
 						reprojections[rotationIdx][candidateRotAxisIdx * 2 + 1]
 					);
 				}
@@ -140,7 +140,7 @@ namespace tinybvh {
 			const float components[3] = { direction.x, direction.y, direction.z };
 
 			// Find face center
-			float faceCenter[3] = { 0.0f, 0.0f, 0.0f };
+			float faceCenter[3] = {0.0f, 0.0f, 0.0f};
 
 			uint8_t majorAxis = 0;
 			if (fabsf(components[1]) > fabsf(components[majorAxis])) 
@@ -148,10 +148,11 @@ namespace tinybvh {
 			if (fabsf(components[2]) > fabsf(components[majorAxis]))
 				majorAxis = 2;
 
-			faceCenter[majorAxis] = components[majorAxis] >= 0.0 ? 1.0f : -1.0f;
+			faceCenter[majorAxis] = components[majorAxis] >= 0.0f ? 1.0f : -1.0f;
+			quadSpherePointToProxyAxis(faceCenter, ret.axisIdx[0], ret.sign[0]);
 
 			// Find cube corner
-			float cubeCorner[3] = { faceCenter[0], faceCenter[1], faceCenter[2] };
+			float cubeCorner[3] = {faceCenter[0], faceCenter[1], faceCenter[2]};
 
 			int minorAxisFirst = (majorAxis + 1) % 3;
 			int minorAxisSecond = (majorAxis + 2) % 3;
@@ -160,15 +161,17 @@ namespace tinybvh {
 			
 			cubeCorner[minorAxisFirst] = minorAxisFirstSign;
 			cubeCorner[minorAxisSecond] = minorAxisSecondSign;
+			quadSpherePointToProxyAxis(cubeCorner, ret.axisIdx[1], ret.sign[1]);
 
 			// Find edge midpoint
-			float edgeMidPoint[3] = { faceCenter[0], faceCenter[1], faceCenter[2] };
+			float edgeMidPoint[3] = {faceCenter[0], faceCenter[1], faceCenter[2]};
 			
 			const bool minorAxisFirstIsLarger = fabsf(components[minorAxisFirst]) >= fabsf(components[minorAxisSecond]);
 			if (minorAxisFirstIsLarger)
 				edgeMidPoint[minorAxisFirst] = minorAxisFirstSign;
 			else
 				edgeMidPoint[minorAxisSecond] = minorAxisSecondSign;
+			quadSpherePointToProxyAxis(edgeMidPoint, ret.axisIdx[2], ret.sign[2]);
 		}
 
 		void quadSpherePointToProxyAxis(const float quadSpherePoint[3], uint8_t& axisIdx, int& sign) {
@@ -223,11 +226,13 @@ namespace tinybvh {
 #define TINY_BVH_DOBB_IMPL_DONE
 
 namespace tinybvh {
+	DOBB_LUT BVH_DOBB::lut;
+
 	BVH_DOBB::~BVH_DOBB()
 	{
 		if (!ownBVH8) bvh8.ReleaseOwnership();
 		AlignedFree(dobbNode);
-
+		
 		AlignedFree(proxyKDop);
 	}
 
@@ -257,9 +262,6 @@ namespace tinybvh {
 			proxyKDop = (kDop*)AlignedAlloc(nodesNeeded * sizeof(kDop));
 		}
 		usedNodes = nodesNeeded;
-
-		// Generate LUT
-		lut = DOBB_LUT();
 
 		// Iterate through nodes backwards (children are processed
 		// implicitly before parents)
@@ -344,8 +346,8 @@ namespace tinybvh {
 					leafVerts[5] = bvh8.bvh.verts[i2];
 
 					// Determine shared vertices
-					uint32_t sharedVert1[2] = { 6, 6 };
-					uint32_t sharedVert2[2] = { 6, 6 };
+					uint32_t sharedVert1[2] = {6, 6};
+					uint32_t sharedVert2[2] = {6, 6};
 
 					for (uint32_t tri1VertIdx = 0; tri1VertIdx < 3; tri1VertIdx++) {
 						for (uint32_t tri2VertIdx = 3; tri2VertIdx < 6; tri2VertIdx++) {
@@ -482,9 +484,10 @@ namespace tinybvh {
 
 					// Select rotation by maxselecting on AABB surface area
 					float childAABBSA = 2.0f * (a * b + b * c + c * a);
+					AABBSASum += childAABBSA;
+
 					if (childAABBSA > AABBSAMax) {
 						AABBSAMax = childAABBSA;
-						AABBSASum += childAABBSA;
 						candidateRotationIdx = dobbNode[currChildIdx].rotation;
 					}
 
@@ -517,7 +520,7 @@ namespace tinybvh {
 
 				// Values for e
 				float DOBBSASum = 0.0f;
-				bvhvec3 minPoint = (BVH_FAR, BVH_FAR, BVH_FAR);
+				bvhvec3 minPoint = {BVH_FAR, BVH_FAR, BVH_FAR};
 
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
 				{
@@ -539,20 +542,25 @@ namespace tinybvh {
 						bvhvec3 c0 = tinybvh_cross(v1, v2);
 						bvhvec3 c1 = tinybvh_cross(v2, v0);
 						bvhvec3 c2 = tinybvh_cross(v0, v1);
-						apexPoint = (c0 * h0 + c1 * h1 + c2 * h2) / tinybvh_dot(v1, c0);
+						apexPoint = (c0 * h0 + c1 * h1 + c2 * h2) / tinybvh_dot(v0, c0);
 						// Determine axis extent by projecting apex point onto the axis
 						rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot(rotatedAxes[rotatedAxesIdx], apexPoint);
 					}
 
-					float a = fabsf(rotatedAxesExtents[0] - rotatedAxesExtents[1]);
-					float b = fabsf(rotatedAxesExtents[2] - rotatedAxesExtents[3]);
-					float c = fabsf(rotatedAxesExtents[4] - rotatedAxesExtents[5]);
+					float a = rotatedAxesExtents[0] + rotatedAxesExtents[1];
+					float b = rotatedAxesExtents[2] + rotatedAxesExtents[3];
+					float c = rotatedAxesExtents[4] + rotatedAxesExtents[5];
 					DOBBSASum += 2 * (a * b + a * c + b * c);
 
+					// Match how other extents get saved
+					rotatedAxesExtents[1] = -rotatedAxesExtents[1];
+					rotatedAxesExtents[3] = -rotatedAxesExtents[3];
+					rotatedAxesExtents[5] = -rotatedAxesExtents[5];
+
 					minPoint = bvhvec3(
-						tinybvh_min(minPoint.x, tinybvh_min(rotatedAxesExtents[0], rotatedAxesExtents[1])),
-						tinybvh_min(minPoint.y, tinybvh_min(rotatedAxesExtents[2], rotatedAxesExtents[3])),
-						tinybvh_min(minPoint.z, tinybvh_min(rotatedAxesExtents[4], rotatedAxesExtents[5]))
+						tinybvh_min(minPoint.x, rotatedAxesExtents[1]),
+						tinybvh_min(minPoint.y, rotatedAxesExtents[3]),
+						tinybvh_min(minPoint.z, rotatedAxesExtents[5])
 					);
 				}
 
@@ -561,7 +569,7 @@ namespace tinybvh {
 				}
 				else {
 					dobbNode[nodeIdx].rotation = 255;
-					minPoint = (
+					minPoint = bvhvec3(
 						proxyKDop[nodeIdx].extents[0].x,
 						proxyKDop[nodeIdx].extents[1].x,
 						proxyKDop[nodeIdx].extents[2].x
