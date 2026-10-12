@@ -401,6 +401,7 @@ namespace tinybvh {
 					float childAABBSA = 2.0f * (a * b + b * c + c * a);
 					if (childAABBSA > AABBSAMax) {
 						AABBSAMax = childAABBSA;
+						AABBSASum += childAABBSA;
 						candidateRotationIdx = dobbNode[currChildIdx].rotation;
 					}
 
@@ -429,6 +430,12 @@ namespace tinybvh {
 					bvhvec3(-candidateRotation.m[0][2], -candidateRotation.m[1][2], -candidateRotation.m[2][2])
 				};
 
+				float rotatedAxesExtents[6];
+
+				// Values for e
+				float DOBBSASum = 0.0f;
+				bvhvec3 minPoint = (BVH_FAR, BVH_FAR, BVH_FAR);
+
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
 				{
 					uint32_t currChildIdx = currNode.child[childIdx];
@@ -440,7 +447,7 @@ namespace tinybvh {
 						float h0, h1, h2; // Extents of selected planes
 						bvhvec3 apexPoint;
 
-						// Do reprojection for the given axis 
+						// Do reprojection for the given axis
 						// TODO: 2) Test against quadsphere
 						// TODO: Remove unnecessary variable declarations after confirming it works correctly
 						// Determine apex point by finding intersection of three planes
@@ -450,9 +457,40 @@ namespace tinybvh {
 						bvhvec3 c2 = tinybvh_cross(v0, v1);
 						apexPoint = (c0 * h0 + c1 * h1 + c2 * h2) / tinybvh_dot(v1, c0);
 						// Determine axis extent by projecting apex point onto the axis
-						float axisExtent = tinybvh_dot(rotatedAxes[rotatedAxesIdx], apexPoint);
+						rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot(rotatedAxes[rotatedAxesIdx], apexPoint);
 					}
+
+					float a = fabsf(rotatedAxesExtents[0] - rotatedAxesExtents[1]);
+					float b = fabsf(rotatedAxesExtents[2] - rotatedAxesExtents[3]);
+					float c = fabsf(rotatedAxesExtents[4] - rotatedAxesExtents[5]);
+					DOBBSASum += 2 * (a * b + a * c + b * c);
+
+					bvhvec3 currMinPoint = bvhvec3(
+						tinybvh_min(rotatedAxesExtents[0], rotatedAxesExtents[1]),
+						tinybvh_min(rotatedAxesExtents[2], rotatedAxesExtents[3]),
+						tinybvh_min(rotatedAxesExtents[4], rotatedAxesExtents[5])
+					);
+
+					minPoint = bvhvec3(
+						tinybvh_min(currMinPoint.x, minPoint.x),
+						tinybvh_min(currMinPoint.y, minPoint.y),
+						tinybvh_min(currMinPoint.z, minPoint.z)
+					);
 				}
+
+				if (DOBBSASum < AABBSASum) {
+					dobbNode[nodeIdx].rotation = candidateRotationIdx;
+				}
+				else {
+					dobbNode[nodeIdx].rotation = 255;
+					minPoint = (
+						proxyKDop[nodeIdx].extents[0].x,
+						proxyKDop[nodeIdx].extents[1].x,
+						proxyKDop[nodeIdx].extents[2].x
+					);
+				}
+
+				// TODO: Encode to compressed node format
 			}
 		}
 	}
