@@ -192,9 +192,22 @@ namespace tinybvh {
 	class BVH_DOBB : public BVHBase {
 	public:
 		// TODO: do compressed BVHNode
-		struct BVHNode
+		struct ALIGNED(16) BVHNode
 		{
+			// Block 0
+			bvhvec3 nodeMinPoint;
+			int8_t exponent[3];
+			uint8_t iMask;
+			// Block 1
+			uint32_t childBaseIndex;
+			uint32_t triBaseIndex;
+			uint8_t meta[8];
+			// Block 2 - 4
+			uint8_t qLo[3][8];
+			uint8_t qHi[3][8];
+			// Block 5
 			uint8_t rotation;
+			uint8_t padding[15];
 		};
 
 		// TODO: move outside of class
@@ -203,6 +216,7 @@ namespace tinybvh {
 		{
 			// Index corresponds to axes
 			bvhvec2 extents[AXESNO];
+			uint8_t rotation;
 		};
 
 		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } // TODO: add layout
@@ -248,24 +262,13 @@ namespace tinybvh {
 		bvh8.ReferenceFrom(original);
 		// get base properties
 		CopyBasePropertiesFrom(bvh8);
-		// allocate if need be
-		const uint32_t nodesNeeded = bvh8.usedNodes;
-		if (allocatedNodes < nodesNeeded)
-		{
-			// Allocate nodes
-			AlignedFree(dobbNode);
-			dobbNode = (BVHNode*)AlignedAlloc(nodesNeeded * sizeof(BVHNode));
-			allocatedNodes = nodesNeeded;
-
-			// Allocate proxy k-DOPs
-			AlignedFree(proxyKDop);
-			proxyKDop = (kDop*)AlignedAlloc(nodesNeeded * sizeof(kDop));
-		}
-		usedNodes = nodesNeeded;
+		// Allocate proxy k-DOPs and rotation sideband data
+		AlignedFree(proxyKDop);
+		proxyKDop = (kDop*)AlignedAlloc(bvh8.usedNodes * sizeof(kDop));
 
 		// Iterate through nodes backwards (children are processed
 		// implicitly before parents)
-		for (int nodeIdx = usedNodes - 1; nodeIdx >= 0; nodeIdx--)
+		for (int nodeIdx = bvh8.usedNodes - 1; nodeIdx >= 0; nodeIdx--)
 		{
 			// Reset proxy k-DOP for min/max selection
 			for (int axisIdx = 0; axisIdx < AXESNO; axisIdx++)
@@ -445,12 +448,12 @@ namespace tinybvh {
 				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
 				float bestSim = 0.0f;
-				dobbNode[nodeIdx].rotation = 255;
+				proxyKDop[nodeIdx].rotation = 255;
 				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
 					float sim = lut.similarity({a0, a1, a2}, rotationIdx);
 					if (sim > bestSim) {
 						bestSim = sim;
-						dobbNode[nodeIdx].rotation = rotationIdx;
+						proxyKDop[nodeIdx].rotation = rotationIdx;
 					}
 				}
 
@@ -489,7 +492,7 @@ namespace tinybvh {
 
 					if (childAABBSA > AABBSAMax) {
 						AABBSAMax = childAABBSA;
-						candidateRotationIdx = dobbNode[currChildIdx].rotation;
+						candidateRotationIdx = proxyKDop[currChildIdx].rotation;
 					}
 
 					// Determine k-DOP extents
@@ -579,10 +582,10 @@ namespace tinybvh {
 				}
 
 				if (DOBBSASum < AABBSASum) {
-					dobbNode[nodeIdx].rotation = candidateRotationIdx;
+					proxyKDop[nodeIdx].rotation = candidateRotationIdx;
 				}
 				else {
-					dobbNode[nodeIdx].rotation = 255;
+					proxyKDop[nodeIdx].rotation = 255;
 					minPoint = bvhvec3(
 						proxyKDop[nodeIdx].extents[0].x,
 						proxyKDop[nodeIdx].extents[1].x,
@@ -591,6 +594,7 @@ namespace tinybvh {
 				}
 
 				// TODO: Encode to compressed node format
+
 			}
 		}
 	}
