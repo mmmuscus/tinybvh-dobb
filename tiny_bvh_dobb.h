@@ -199,15 +199,21 @@ namespace tinybvh {
 			int8_t exponent[3];
 			uint8_t iMask;
 			// Block 1
-			uint32_t childBaseIndex;
+			uint32_t childBaseIndexRotation;	// 0 - 23: childBaseIndex, 24 - 31: rotation
 			uint32_t triBaseIndex;
 			uint8_t meta[8];
 			// Block 2 - 4
 			uint8_t qLo[3][8];
 			uint8_t qHi[3][8];
-			// Block 5
-			uint8_t rotation;
-			uint8_t padding[15];
+
+			static constexpr uint32_t CHILD_INDEX_BITS = 24;
+			static constexpr uint32_t CHILD_INDEX_MASK = (1u << CHILD_INDEX_BITS) - 1u;
+
+			uint32_t ChildBaseIndex() const { return childBaseIndexRotation & CHILD_INDEX_MASK; }
+			uint8_t Rotation() const { return (uint8_t)(childBaseIndexRotation >> CHILD_INDEX_BITS); }
+			void SetChildBaseIndexRotation(const uint32_t childBaseIndex, const uint8_t rotationIndex) {
+				childBaseIndexRotation = (childBaseIndex & CHILD_INDEX_MASK) | ((uint32_t)rotationIndex << CHILD_INDEX_BITS);
+			}
 		};
 
 		// TODO: move outside of class
@@ -265,6 +271,10 @@ namespace tinybvh {
 		// Allocate proxy k-DOPs and rotation sideband data
 		AlignedFree(proxyKDop);
 		proxyKDop = (kDop*)AlignedAlloc(bvh8.usedNodes * sizeof(kDop));
+
+		// Count the number of interior nodes in bvh8, DOBB BVH needs this
+		// amount of nodes in total
+		uint32_t nodesNeeded = 0;
 
 		// Iterate through nodes backwards (children are processed
 		// implicitly before parents)
@@ -472,6 +482,9 @@ namespace tinybvh {
 			}
 			else
 			{
+				// Increment nodes needed for DOBB_BVH
+				nodesNeeded++;
+
 				float AABBSAMax = 0.0f;
 				uint8_t candidateRotationIdx = 0;
 				float AABBSASum = 0.0f;
@@ -597,6 +610,14 @@ namespace tinybvh {
 
 			}
 		}
+
+		// Allocate nodes for DOBB_BVH
+		if (allocatedNodes < nodesNeeded) {
+			AlignedFree(dobbNode);
+			dobbNode = (BVHNode*)AlignedAlloc(nodesNeeded * sizeof(BVHNode));
+			allocatedNodes = nodesNeeded;
+		}
+		usedNodes = nodesNeeded;
 	}
 
 } // namespace tinybvh
