@@ -540,7 +540,23 @@ namespace tinybvh {
 		}
 		usedNodes = nodesNeeded;
 	
-		uint32_t dobbNodeIdx = 0;
+		uint32_t stackBvhNodes[256], stackDobbNodes[256];
+		stackBvhNodes[0] = 0; stackDobbNodes[0] = 0;
+		uint32_t stackIdx = 1;
+		uint32_t dobbNodeIdx = 1, dobbTriIdx = 0;
+
+		while (stackIdx > 0) {
+			// Pop top member of stack
+			stackIdx--;
+			uint32_t currBvhIdx = stackBvhNodes[stackIdx];
+			uint32_t currDobbIdx = stackDobbNodes[stackIdx];
+			const auto& currBvhNode = bvh8.mbvhNode[currBvhIdx];
+			BVHNode& currDobbNode = dobbNode[currBvhIdx];
+			memset(&currDobbNode, 0, sizeof(BVHNode));
+
+			
+		}
+
 		for (uint32_t nodeIdx = 0; nodeIdx < bvh8.usedNodes; nodeIdx++) {
 			const auto& currNode = bvh8.mbvhNode[nodeIdx];
 
@@ -564,6 +580,7 @@ namespace tinybvh {
 				// Values for e
 				float DOBBSASum = 0.0f;
 				bvhvec3 minPoint = { BVH_FAR, BVH_FAR, BVH_FAR };
+				bvhvec3 maxPoint = { -BVH_FAR, -BVH_FAR, -BVH_FAR };
 
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
 				{
@@ -581,7 +598,7 @@ namespace tinybvh {
 						bvhvec3 v0 = proxyKDopAxes[reprojection.axisIdx[0]] * (float)reprojection.sign[0];
 						bvhvec3 v1 = proxyKDopAxes[reprojection.axisIdx[1]] * (float)reprojection.sign[1];
 						bvhvec3 v2 = proxyKDopAxes[reprojection.axisIdx[2]] * (float)reprojection.sign[2];
-						// Extents of selected planesű
+						// Extents of selected planes
 						float h0, h1, h2;
 						if (reprojection.sign[0] == 1)
 							h0 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[0]].y;
@@ -618,17 +635,27 @@ namespace tinybvh {
 						tinybvh_min(minPoint.y, rotatedAxesExtents[3]),
 						tinybvh_min(minPoint.z, rotatedAxesExtents[5])
 					);
+
+					maxPoint = bvhvec3(
+						tinybvh_max(maxPoint.x, rotatedAxesExtents[0]),
+						tinybvh_max(maxPoint.y, rotatedAxesExtents[2]),
+						tinybvh_max(maxPoint.z, rotatedAxesExtents[4])
+					);
 				}
 
 				if (DOBBSASum < sideband[nodeIdx].AABBSASum) {
-					sideband[nodeIdx].rotation = candidateRotationIdx;
+					;
 				}
 				else {
-					sideband[nodeIdx].rotation = 255;
 					minPoint = bvhvec3(
 						sideband[nodeIdx].kDopExtents[0].x,
 						sideband[nodeIdx].kDopExtents[1].x,
 						sideband[nodeIdx].kDopExtents[2].x
+					);
+					maxPoint = bvhvec3(
+						sideband[nodeIdx].kDopExtents[0].y,
+						sideband[nodeIdx].kDopExtents[1].y,
+						sideband[nodeIdx].kDopExtents[2].y
 					);
 				}
 
