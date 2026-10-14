@@ -485,6 +485,24 @@ namespace tinybvh {
 				// Increment nodes needed for DOBB_BVH
 				nodesNeeded++;
 
+				// Process internal nodes
+				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
+				{
+					uint32_t currChildIdx = currNode.child[childIdx];
+
+					// Determine k-DOP extents
+					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++)
+					{
+						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
+							proxyKDop[currChildIdx].extents[axisIdx].x,
+							proxyKDop[nodeIdx].extents[axisIdx].x);
+
+						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
+							proxyKDop[currChildIdx].extents[axisIdx].y,
+							proxyKDop[nodeIdx].extents[axisIdx].y);
+					}
+				}
+
 				float AABBSAMax = 0.0f;
 				uint8_t candidateRotationIdx = 0;
 				float AABBSASum = 0.0f;
@@ -507,20 +525,27 @@ namespace tinybvh {
 						AABBSAMax = childAABBSA;
 						candidateRotationIdx = proxyKDop[currChildIdx].rotation;
 					}
-
-					// Determine k-DOP extents
-					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++)
-					{
-						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
-							proxyKDop[currChildIdx].extents[axisIdx].x,
-							proxyKDop[nodeIdx].extents[axisIdx].x);
-
-						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
-							proxyKDop[currChildIdx].extents[axisIdx].y,
-							proxyKDop[nodeIdx].extents[axisIdx].y);
-					}
 				}
 
+				proxyKDop[nodeIdx].rotation = candidateRotationIdx;
+			}
+		}
+
+		// Allocate nodes for DOBB_BVH
+		if (allocatedNodes < nodesNeeded) {
+			AlignedFree(dobbNode);
+			dobbNode = (BVHNode*)AlignedAlloc(nodesNeeded * sizeof(BVHNode));
+			allocatedNodes = nodesNeeded;
+		}
+		usedNodes = nodesNeeded;
+	
+		uint32_t dobbNodeIdx = 0;
+		for (uint32_t nodeIdx = 0; nodeIdx < bvh8.usedNodes; nodeIdx++) {
+			const auto& currNode = bvh8.mbvhNode[nodeIdx];
+
+			// Decide if leaf or not
+			if (!currNode.isLeaf()) {
+			uint32_t candidateRotationIdx = proxyKDop[nodeIdx].rotation;
 				DOBB_LUT::Mat3 candidateRotation = lut.rotations[candidateRotationIdx];
 
 				// Collect basis vectors of current rotation
@@ -537,7 +562,7 @@ namespace tinybvh {
 
 				// Values for e
 				float DOBBSASum = 0.0f;
-				bvhvec3 minPoint = {BVH_FAR, BVH_FAR, BVH_FAR};
+				bvhvec3 minPoint = { BVH_FAR, BVH_FAR, BVH_FAR };
 
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
 				{
@@ -606,18 +631,10 @@ namespace tinybvh {
 					);
 				}
 
-				// TODO: Encode to compressed node format
-
+				// Increment dobbNodeIdx after processing current internal node
+				dobbNodeIdx++;
 			}
 		}
-
-		// Allocate nodes for DOBB_BVH
-		if (allocatedNodes < nodesNeeded) {
-			AlignedFree(dobbNode);
-			dobbNode = (BVHNode*)AlignedAlloc(nodesNeeded * sizeof(BVHNode));
-			allocatedNodes = nodesNeeded;
-		}
-		usedNodes = nodesNeeded;
 	}
 
 } // namespace tinybvh
