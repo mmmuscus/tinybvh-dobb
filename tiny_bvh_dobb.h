@@ -218,11 +218,12 @@ namespace tinybvh {
 
 		// TODO: move outside of class
 		// Only implementing |K| = 13 case
-		struct kDop
+		struct sidebandData
 		{
 			// Index corresponds to axes
-			bvhvec2 extents[AXESNO];
+			bvhvec2 kDopExtents[AXESNO];
 			uint8_t rotation;
+			float AABBSASum;
 		};
 
 		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } // TODO: add layout
@@ -234,7 +235,7 @@ namespace tinybvh {
 		MBVH<8> bvh8;
 		bool ownBVH8 = true;
 
-		kDop* proxyKDop = 0;
+		sidebandData* sideband = 0;
 		static DOBB_LUT lut;
 };
 
@@ -253,7 +254,7 @@ namespace tinybvh {
 		if (!ownBVH8) bvh8.ReleaseOwnership();
 		AlignedFree(dobbNode);
 		
-		AlignedFree(proxyKDop);
+		AlignedFree(sideband);
 	}
 
 	void BVH_DOBB::ConvertFrom(const MBVH<8>& original)
@@ -269,8 +270,8 @@ namespace tinybvh {
 		// get base properties
 		CopyBasePropertiesFrom(bvh8);
 		// Allocate proxy k-DOPs and rotation sideband data
-		AlignedFree(proxyKDop);
-		proxyKDop = (kDop*)AlignedAlloc(bvh8.usedNodes * sizeof(kDop));
+		AlignedFree(sideband);
+		sideband = (sidebandData*)AlignedAlloc(bvh8.usedNodes * sizeof(sidebandData));
 
 		// Count the number of interior nodes in bvh8, DOBB BVH needs this
 		// amount of nodes in total
@@ -283,7 +284,7 @@ namespace tinybvh {
 			// Reset proxy k-DOP for min/max selection
 			for (int axisIdx = 0; axisIdx < AXESNO; axisIdx++)
 			{
-				proxyKDop[nodeIdx].extents[axisIdx] = bvhvec2(BVH_FAR, -BVH_FAR);
+				sideband[nodeIdx].kDopExtents[axisIdx] = bvhvec2(BVH_FAR, -BVH_FAR);
 			}
 
 			const auto& currNode = bvh8.mbvhNode[nodeIdx];
@@ -458,25 +459,25 @@ namespace tinybvh {
 				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
 				float bestSim = 0.0f;
-				proxyKDop[nodeIdx].rotation = 255;
+				sideband[nodeIdx].rotation = 255;
 				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
 					float sim = lut.similarity({a0, a1, a2}, rotationIdx);
 					if (sim > bestSim) {
 						bestSim = sim;
-						proxyKDop[nodeIdx].rotation = rotationIdx;
+						sideband[nodeIdx].rotation = rotationIdx;
 					}
 				}
 
 				// Create proxy KDop to propagate up
 				for (uint32_t vertIdx = 0; vertIdx < noLeafVerts; vertIdx++) {
 					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) {
-						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
+						sideband[nodeIdx].kDopExtents[axisIdx].x = tinybvh_min(
 							tinybvh_dot(proxyKDopAxes[axisIdx], leafVerts[vertIdx]),
-							proxyKDop[nodeIdx].extents[axisIdx].x);
+							sideband[nodeIdx].kDopExtents[axisIdx].x);
 
-						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
+						sideband[nodeIdx].kDopExtents[axisIdx].y = tinybvh_max(
 							tinybvh_dot(proxyKDopAxes[axisIdx], leafVerts[vertIdx]),
-							proxyKDop[nodeIdx].extents[axisIdx].y);
+							sideband[nodeIdx].kDopExtents[axisIdx].y);
 					}
 				}
 			}
@@ -493,19 +494,19 @@ namespace tinybvh {
 					// Determine k-DOP extents
 					for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++)
 					{
-						proxyKDop[nodeIdx].extents[axisIdx].x = tinybvh_min(
-							proxyKDop[currChildIdx].extents[axisIdx].x,
-							proxyKDop[nodeIdx].extents[axisIdx].x);
+						sideband[nodeIdx].kDopExtents[axisIdx].x = tinybvh_min(
+							sideband[currChildIdx].kDopExtents[axisIdx].x,
+							sideband[nodeIdx].kDopExtents[axisIdx].x);
 
-						proxyKDop[nodeIdx].extents[axisIdx].y = tinybvh_max(
-							proxyKDop[currChildIdx].extents[axisIdx].y,
-							proxyKDop[nodeIdx].extents[axisIdx].y);
+						sideband[nodeIdx].kDopExtents[axisIdx].y = tinybvh_max(
+							sideband[currChildIdx].kDopExtents[axisIdx].y,
+							sideband[nodeIdx].kDopExtents[axisIdx].y);
 					}
 				}
 
 				float AABBSAMax = 0.0f;
 				uint8_t candidateRotationIdx = 0;
-				float AABBSASum = 0.0f;
+				sideband[nodeIdx].AABBSASum = 0.0f;
 
 				// Process internal nodes
 				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
@@ -513,21 +514,21 @@ namespace tinybvh {
 					uint32_t currChildIdx = currNode.child[childIdx];
 
 					// Gather extents from euclidean axes from axes collection
-					float a = fabsf(proxyKDop[currChildIdx].extents[0].x - proxyKDop[currChildIdx].extents[0].y);
-					float b = fabsf(proxyKDop[currChildIdx].extents[1].x - proxyKDop[currChildIdx].extents[1].y);
-					float c = fabsf(proxyKDop[currChildIdx].extents[2].x - proxyKDop[currChildIdx].extents[2].y);
+					float a = fabsf(sideband[currChildIdx].kDopExtents[0].x - sideband[currChildIdx].kDopExtents[0].y);
+					float b = fabsf(sideband[currChildIdx].kDopExtents[1].x - sideband[currChildIdx].kDopExtents[1].y);
+					float c = fabsf(sideband[currChildIdx].kDopExtents[2].x - sideband[currChildIdx].kDopExtents[2].y);
 
 					// Select rotation by maxselecting on AABB surface area
 					float childAABBSA = 2.0f * (a * b + b * c + c * a);
-					AABBSASum += childAABBSA;
+					sideband[nodeIdx].AABBSASum += childAABBSA;
 
 					if (childAABBSA > AABBSAMax) {
 						AABBSAMax = childAABBSA;
-						candidateRotationIdx = proxyKDop[currChildIdx].rotation;
+						candidateRotationIdx = sideband[currChildIdx].rotation;
 					}
 				}
 
-				proxyKDop[nodeIdx].rotation = candidateRotationIdx;
+				sideband[nodeIdx].rotation = candidateRotationIdx;
 			}
 		}
 
@@ -545,7 +546,7 @@ namespace tinybvh {
 
 			// Decide if leaf or not
 			if (!currNode.isLeaf()) {
-			uint32_t candidateRotationIdx = proxyKDop[nodeIdx].rotation;
+			uint32_t candidateRotationIdx = sideband[nodeIdx].rotation;
 				DOBB_LUT::Mat3 candidateRotation = lut.rotations[candidateRotationIdx];
 
 				// Collect basis vectors of current rotation
@@ -583,14 +584,14 @@ namespace tinybvh {
 						// Extents of selected planesű
 						float h0, h1, h2;
 						if (reprojection.sign[0] == 1)
-							h0 = proxyKDop[currChildIdx].extents[reprojection.axisIdx[0]].y;
-						else h0 = -proxyKDop[currChildIdx].extents[reprojection.axisIdx[0]].x;
+							h0 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[0]].y;
+						else h0 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[0]].x;
 						if (reprojection.sign[1] == 1)
-							h1 = proxyKDop[currChildIdx].extents[reprojection.axisIdx[1]].y;
-						else h1 = -proxyKDop[currChildIdx].extents[reprojection.axisIdx[1]].x;
+							h1 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[1]].y;
+						else h1 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[1]].x;
 						if (reprojection.sign[2] == 1)
-							h2 = proxyKDop[currChildIdx].extents[reprojection.axisIdx[2]].y;
-						else h2 = -proxyKDop[currChildIdx].extents[reprojection.axisIdx[2]].x;
+							h2 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].y;
+						else h2 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].x;
 						// TODO: Remove unnecessary variable declarations after confirming it works correctly
 						// Determine apex point by finding intersection of three planes
 						// Find vectors colinear with the intersection of pairwise planes
@@ -619,15 +620,15 @@ namespace tinybvh {
 					);
 				}
 
-				if (DOBBSASum < AABBSASum) {
-					proxyKDop[nodeIdx].rotation = candidateRotationIdx;
+				if (DOBBSASum < sideband[nodeIdx].AABBSASum) {
+					sideband[nodeIdx].rotation = candidateRotationIdx;
 				}
 				else {
-					proxyKDop[nodeIdx].rotation = 255;
+					sideband[nodeIdx].rotation = 255;
 					minPoint = bvhvec3(
-						proxyKDop[nodeIdx].extents[0].x,
-						proxyKDop[nodeIdx].extents[1].x,
-						proxyKDop[nodeIdx].extents[2].x
+						sideband[nodeIdx].kDopExtents[0].x,
+						sideband[nodeIdx].kDopExtents[1].x,
+						sideband[nodeIdx].kDopExtents[2].x
 					);
 				}
 
