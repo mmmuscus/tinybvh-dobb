@@ -223,6 +223,15 @@ namespace tinybvh {
 			void SetChildBaseIndexRotation(const uint32_t childBaseIndex, const uint8_t rotationIndex) {
 				childBaseIndexRotation = (childBaseIndex & CHILD_INDEX_MASK) | ((uint32_t)rotationIndex << CHILD_INDEX_BITS);
 			}
+
+			uint8_t OccupiedMask() const {
+				uint8_t occupied = 0;
+				for (uint8_t slot = 0; slot < 8; slot++)
+					occupied |= (uint8_t)((meta[slot] != 0) << slot);
+				return occupied;
+			}
+
+			uint8_t LeafMask() const { return OccupiedMask() & ~iMask; }
 		};
 
 		// TODO: move outside of class
@@ -245,6 +254,8 @@ namespace tinybvh {
 
 		// Leaves can have at most two triangles in them!
 		void ConvertFrom(const MBVH<8>& original);
+
+		int32_t Intersect(Ray& ray) const;
 
 		// BVH data
 		BVHNode* dobbNode = 0;
@@ -595,7 +606,7 @@ namespace tinybvh {
 			allocatedPrimIndices = idxCount;
 		}
 	
-		uint32_t stackBvhNodes[256], stackDobbNodes[256];
+		uint32_t stackBvhNodes[512], stackDobbNodes[512];
 		stackBvhNodes[0] = 0; stackDobbNodes[0] = 0;
 		uint32_t stackIdx = 1;
 		uint32_t dobbNodeIdx = 1, dobbTriIdx = 0;
@@ -740,6 +751,7 @@ namespace tinybvh {
 			// Fill rest of the data for the compressed nodes
 			for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++) {
 				// Fill qLo and qHi
+				// TODO: unroll!
 				for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++) {
 					const float currQLo = floorf((childMinPoint[childIdx][axisIdx] - minPoint[axisIdx]) * inverseScale[axisIdx]);
 					currDobbNode.qLo[axisIdx][childIdx] = (uint8_t)tinybvh_clamp(currQLo, 0.0f, 255.0f);
@@ -798,5 +810,30 @@ namespace tinybvh {
 		sideband = 0;
 	}
 
+	int32_t BVH_DOBB::Intersect(Ray& ray) const {
+		uint32_t nodeStack[512];
+		uint32_t stackIdx = 0;
+		nodeStack[stackIdx++] = 0;
+
+		while (stackIdx > 0) {
+			uint32_t currNodeIdx = nodeStack[--stackIdx];
+			BVHNode& currNode = dobbNode[currNodeIdx];
+
+			// TODO: Transform ray
+
+			float stepSize[3] = {
+				ldexpf(1.0f, currNode.exponent[0]),
+				ldexpf(1.0f, currNode.exponent[1]),
+				ldexpf(1.0f, currNode.exponent[2]),
+			};
+
+			uint32_t hitMask = 0;
+
+
+			for (uint32_t slot = 0; slot < 8; slot++) {
+				 
+			}
+		}
+	}
 } // namespace tinybvh
 #endif // TINYBVH_DOBB_IMPLEMENTATION
