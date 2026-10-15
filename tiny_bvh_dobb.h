@@ -8,6 +8,11 @@
 #define AXESNO 13
 #define SMALLM 4
 
+// TODO: General refactor:
+//	- use const consistently
+//  - remove uneccessary declaration
+//	- you can index bvhvec3-s, use it where its useful!
+
 namespace tinybvh {
 	static const bvhvec3 proxyKDopAxes[AXESNO] = {
 		// 3 Euclidian axes
@@ -232,6 +237,8 @@ namespace tinybvh {
 
 		// BVH data
 		BVHNode* dobbNode = 0;
+		uint32_t* dobbPrimIdx = 0;
+		uint32_t allocatedPrimIndices = 0;
 		MBVH<8> bvh8;
 		bool ownBVH8 = true;
 
@@ -253,6 +260,7 @@ namespace tinybvh {
 	{
 		if (!ownBVH8) bvh8.ReleaseOwnership();
 		AlignedFree(dobbNode);
+		AlignedFree(dobbPrimIdx);
 		
 		AlignedFree(sideband);
 	}
@@ -262,7 +270,7 @@ namespace tinybvh {
 		// copy source
 		if (&original != &bvh8)
 		{
-			if (ownBVH8) bvh8 = MBVH<8>(context); 
+			if (ownBVH8) bvh8 = MBVH<8>(context);
 			else bvh8.DropReference(context);
 			ownBVH8 = false;
 		}
@@ -334,11 +342,11 @@ namespace tinybvh {
 					uint32_t midPointIdx = (longestIdx + 2) % 3;
 
 					if (lengthsSqd[midPointIdx] < lengthsSqd[(midPointIdx + 2) % 3]) {
-						a0 = edges[midPointIdx]; 
+						a0 = edges[midPointIdx];
 						a1 = -edges[(midPointIdx + 2) % 3];
 					}
-					else { 
-						a0 = -edges[(midPointIdx + 2) % 3]; 
+					else {
+						a0 = -edges[(midPointIdx + 2) % 3];
 						a1 = edges[midPointIdx];
 					}
 				}
@@ -360,8 +368,8 @@ namespace tinybvh {
 					leafVerts[5] = bvh8.bvh.verts[i2];
 
 					// Determine shared vertices
-					uint32_t sharedVert1[2] = {6, 6};
-					uint32_t sharedVert2[2] = {6, 6};
+					uint32_t sharedVert1[2] = { 6, 6 };
+					uint32_t sharedVert2[2] = { 6, 6 };
 
 					for (uint32_t tri1VertIdx = 0; tri1VertIdx < 3; tri1VertIdx++) {
 						for (uint32_t tri2VertIdx = 3; tri2VertIdx < 6; tri2VertIdx++) {
@@ -455,13 +463,13 @@ namespace tinybvh {
 				a0 = tinybvh_normalize(a0);
 				a2 = tinybvh_normalize(tinybvh_cross(a0, a1));
 				a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
-				
+
 				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
 				float bestSim = 0.0f;
 				sideband[nodeIdx].rotation = 255;
 				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
-					float sim = lut.similarity({a0, a1, a2}, rotationIdx);
+					float sim = lut.similarity({ a0, a1, a2 }, rotationIdx);
 					if (sim > bestSim) {
 						bestSim = sim;
 						sideband[nodeIdx].rotation = rotationIdx;
@@ -532,13 +540,20 @@ namespace tinybvh {
 			}
 		}
 
-		// Allocate nodes for DOBB_BVH
+		// Allocate nodes and tri indices for DOBB_BVH
 		if (allocatedNodes < nodesNeeded) {
 			AlignedFree(dobbNode);
 			dobbNode = (BVHNode*)AlignedAlloc(nodesNeeded * sizeof(BVHNode));
+
 			allocatedNodes = nodesNeeded;
 		}
-		usedNodes = nodesNeeded;
+
+		if (allocatedPrimIndices < idxCount) {
+			AlignedFree(dobbPrimIdx);
+			dobbPrimIdx = (uint32_t*)AlignedAlloc(idxCount * sizeof(uint32_t));
+		
+			allocatedPrimIndices = idxCount;
+		}
 	
 		uint32_t stackBvhNodes[256], stackDobbNodes[256];
 		stackBvhNodes[0] = 0; stackDobbNodes[0] = 0;
@@ -551,118 +566,193 @@ namespace tinybvh {
 			uint32_t currBvhIdx = stackBvhNodes[stackIdx];
 			uint32_t currDobbIdx = stackDobbNodes[stackIdx];
 			const auto& currBvhNode = bvh8.mbvhNode[currBvhIdx];
-			BVHNode& currDobbNode = dobbNode[currBvhIdx];
+			BVHNode& currDobbNode = dobbNode[currDobbIdx];
 			memset(&currDobbNode, 0, sizeof(BVHNode));
 
-			
-		}
+			uint8_t candidateRotationIdx = sideband[currBvhIdx].rotation;
+			DOBB_LUT::Mat3 candidateRotation = lut.rotations[candidateRotationIdx];
 
-		for (uint32_t nodeIdx = 0; nodeIdx < bvh8.usedNodes; nodeIdx++) {
-			const auto& currNode = bvh8.mbvhNode[nodeIdx];
+			// Collect basis vectors of current rotation
+			bvhvec3 rotatedAxes[6] = {
+				bvhvec3(candidateRotation.m[0][0], candidateRotation.m[1][0], candidateRotation.m[2][0]),
+				bvhvec3(-candidateRotation.m[0][0], -candidateRotation.m[1][0], -candidateRotation.m[2][0]),
+				bvhvec3(candidateRotation.m[0][1], candidateRotation.m[1][1], candidateRotation.m[2][1]),
+				bvhvec3(-candidateRotation.m[0][1], -candidateRotation.m[1][1], -candidateRotation.m[2][1]),
+				bvhvec3(candidateRotation.m[0][2], candidateRotation.m[1][2], candidateRotation.m[2][2]),
+				bvhvec3(-candidateRotation.m[0][2], -candidateRotation.m[1][2], -candidateRotation.m[2][2])
+			};
 
-			// Decide if leaf or not
-			if (!currNode.isLeaf()) {
-			uint32_t candidateRotationIdx = sideband[nodeIdx].rotation;
-				DOBB_LUT::Mat3 candidateRotation = lut.rotations[candidateRotationIdx];
+			float rotatedAxesExtents[6];
 
-				// Collect basis vectors of current rotation
-				bvhvec3 rotatedAxes[6] = {
-					bvhvec3(candidateRotation.m[0][0], candidateRotation.m[1][0], candidateRotation.m[2][0]),
-					bvhvec3(-candidateRotation.m[0][0], -candidateRotation.m[1][0], -candidateRotation.m[2][0]),
-					bvhvec3(candidateRotation.m[0][1], candidateRotation.m[1][1], candidateRotation.m[2][1]),
-					bvhvec3(-candidateRotation.m[0][1], -candidateRotation.m[1][1], -candidateRotation.m[2][1]),
-					bvhvec3(candidateRotation.m[0][2], candidateRotation.m[1][2], candidateRotation.m[2][2]),
-					bvhvec3(-candidateRotation.m[0][2], -candidateRotation.m[1][2], -candidateRotation.m[2][2])
-				};
+			// Values for e
+			float DOBBSASum = 0.0f;
+			bvhvec3 childMinPoint[8], childMaxPoint[8];
 
-				float rotatedAxesExtents[6];
+			for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
+			{
+				uint32_t currChildIdx = currBvhNode.child[childIdx];
 
-				// Values for e
-				float DOBBSASum = 0.0f;
-				bvhvec3 minPoint = { BVH_FAR, BVH_FAR, BVH_FAR };
-				bvhvec3 maxPoint = { -BVH_FAR, -BVH_FAR, -BVH_FAR };
-
-				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
+				// Do reprojection based on the selected rotation
+				for (uint32_t rotatedAxesIdx = 0; rotatedAxesIdx < 6; rotatedAxesIdx++)
 				{
-					uint32_t currChildIdx = currNode.child[childIdx];
+					bvhvec3 apexPoint;
 
-					// Do reprojection based on the selected rotation
-					for (uint32_t rotatedAxesIdx = 0; rotatedAxesIdx < 6; rotatedAxesIdx++)
-					{
-						bvhvec3 apexPoint;
-
-						// Do reprojection for the given axis
-						// Reprojection entry corresponding to current rotation and axis
-						const DOBB_LUT::reprojectionEntry& reprojection = lut.reprojections[candidateRotationIdx][rotatedAxesIdx];
-						// Normals of selected planes
-						bvhvec3 v0 = proxyKDopAxes[reprojection.axisIdx[0]] * (float)reprojection.sign[0];
-						bvhvec3 v1 = proxyKDopAxes[reprojection.axisIdx[1]] * (float)reprojection.sign[1];
-						bvhvec3 v2 = proxyKDopAxes[reprojection.axisIdx[2]] * (float)reprojection.sign[2];
-						// Extents of selected planes
-						float h0, h1, h2;
-						if (reprojection.sign[0] == 1)
-							h0 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[0]].y;
-						else h0 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[0]].x;
-						if (reprojection.sign[1] == 1)
-							h1 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[1]].y;
-						else h1 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[1]].x;
-						if (reprojection.sign[2] == 1)
-							h2 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].y;
-						else h2 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].x;
-						// TODO: Remove unnecessary variable declarations after confirming it works correctly
-						// Determine apex point by finding intersection of three planes
-						// Find vectors colinear with the intersection of pairwise planes
-						bvhvec3 c0 = tinybvh_cross(v1, v2);
-						bvhvec3 c1 = tinybvh_cross(v2, v0);
-						bvhvec3 c2 = tinybvh_cross(v0, v1);
-						apexPoint = (c0 * h0 + c1 * h1 + c2 * h2) / tinybvh_dot(v0, c0);
-						// Determine axis extent by projecting apex point onto the axis
-						rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot(rotatedAxes[rotatedAxesIdx], apexPoint);
-					}
-
-					float a = rotatedAxesExtents[0] + rotatedAxesExtents[1];
-					float b = rotatedAxesExtents[2] + rotatedAxesExtents[3];
-					float c = rotatedAxesExtents[4] + rotatedAxesExtents[5];
-					DOBBSASum += 2 * (a * b + a * c + b * c);
-
-					// Match how other extents get saved
-					rotatedAxesExtents[1] = -rotatedAxesExtents[1];
-					rotatedAxesExtents[3] = -rotatedAxesExtents[3];
-					rotatedAxesExtents[5] = -rotatedAxesExtents[5];
-
-					minPoint = bvhvec3(
-						tinybvh_min(minPoint.x, rotatedAxesExtents[1]),
-						tinybvh_min(minPoint.y, rotatedAxesExtents[3]),
-						tinybvh_min(minPoint.z, rotatedAxesExtents[5])
-					);
-
-					maxPoint = bvhvec3(
-						tinybvh_max(maxPoint.x, rotatedAxesExtents[0]),
-						tinybvh_max(maxPoint.y, rotatedAxesExtents[2]),
-						tinybvh_max(maxPoint.z, rotatedAxesExtents[4])
-					);
+					// Do reprojection for the given axis
+					// Reprojection entry corresponding to current rotation and axis
+					const DOBB_LUT::reprojectionEntry& reprojection = lut.reprojections[candidateRotationIdx][rotatedAxesIdx];
+					// Normals of selected planes
+					bvhvec3 v0 = proxyKDopAxes[reprojection.axisIdx[0]] * (float)reprojection.sign[0];
+					bvhvec3 v1 = proxyKDopAxes[reprojection.axisIdx[1]] * (float)reprojection.sign[1];
+					bvhvec3 v2 = proxyKDopAxes[reprojection.axisIdx[2]] * (float)reprojection.sign[2];
+					// Extents of selected planes
+					float h0, h1, h2;
+					if (reprojection.sign[0] == 1)
+						h0 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[0]].y;
+					else h0 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[0]].x;
+					if (reprojection.sign[1] == 1)
+						h1 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[1]].y;
+					else h1 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[1]].x;
+					if (reprojection.sign[2] == 1)
+						h2 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].y;
+					else h2 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].x;
+					// TODO: Remove unnecessary variable declarations after confirming it works correctly
+					// Determine apex point by finding intersection of three planes
+					// Find vectors colinear with the intersection of pairwise planes
+					bvhvec3 c0 = tinybvh_cross(v1, v2);
+					bvhvec3 c1 = tinybvh_cross(v2, v0);
+					bvhvec3 c2 = tinybvh_cross(v0, v1);
+					apexPoint = (c0 * h0 + c1 * h1 + c2 * h2) / tinybvh_dot(v0, c0);
+					// Determine axis extent by projecting apex point onto the axis
+					rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot(rotatedAxes[rotatedAxesIdx], apexPoint);
 				}
 
-				if (DOBBSASum < sideband[nodeIdx].AABBSASum) {
-					;
-				}
-				else {
-					minPoint = bvhvec3(
-						sideband[nodeIdx].kDopExtents[0].x,
-						sideband[nodeIdx].kDopExtents[1].x,
-						sideband[nodeIdx].kDopExtents[2].x
-					);
-					maxPoint = bvhvec3(
-						sideband[nodeIdx].kDopExtents[0].y,
-						sideband[nodeIdx].kDopExtents[1].y,
-						sideband[nodeIdx].kDopExtents[2].y
-					);
-				}
+				childMinPoint[childIdx].x = -rotatedAxesExtents[1];
+				childMinPoint[childIdx].y = -rotatedAxesExtents[3];
+				childMinPoint[childIdx].z = -rotatedAxesExtents[5];
 
-				// Increment dobbNodeIdx after processing current internal node
-				dobbNodeIdx++;
+				childMaxPoint[childIdx].x = rotatedAxesExtents[0];
+				childMaxPoint[childIdx].y = rotatedAxesExtents[2];
+				childMaxPoint[childIdx].z = rotatedAxesExtents[4];
+
+				float a = childMaxPoint[childIdx].x - childMinPoint[childIdx].x;
+				float b = childMaxPoint[childIdx].y - childMinPoint[childIdx].y;
+				float c = childMaxPoint[childIdx].z - childMinPoint[childIdx].z;
+				DOBBSASum += 2 * (a * b + a * c + b * c);
 			}
+
+			// Determine chosen rotation, record extents if no rotation
+			uint8_t chosenRotation;
+
+			if (DOBBSASum < sideband[currBvhIdx].AABBSASum) {
+				chosenRotation = candidateRotationIdx;
+			}
+			else {
+				chosenRotation = 255;
+
+				for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++) {
+					uint32_t currChildIdx = currBvhNode.child[childIdx];
+
+					childMinPoint[childIdx] = bvhvec3(
+						sideband[currChildIdx].kDopExtents[0].x,
+						sideband[currChildIdx].kDopExtents[1].x,
+						sideband[currChildIdx].kDopExtents[2].x);
+					childMaxPoint[childIdx] = bvhvec3(
+						sideband[currChildIdx].kDopExtents[0].y,
+						sideband[currChildIdx].kDopExtents[1].y,
+						sideband[currChildIdx].kDopExtents[2].y);
+				}
+			}
+
+			// Determine min and max points of bounding boxes
+			bvhvec3 minPoint = { BVH_FAR, BVH_FAR, BVH_FAR };
+			bvhvec3 maxPoint = { -BVH_FAR, -BVH_FAR, -BVH_FAR };
+
+			for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++) {
+				minPoint = tinybvh_min(minPoint, childMinPoint[childIdx]);
+				maxPoint = tinybvh_max(maxPoint, childMaxPoint[childIdx]);
+			}
+
+			currDobbNode.nodeMinPoint = minPoint;
+
+			// To be used to calculate qLo-s and qHi-s
+			float inverseScale[3];
+
+			// Quantize extent of current bounding box
+			for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++) {
+				const float extent = maxPoint[axisIdx] - minPoint[axisIdx];
+				// guard against in-plane BBs
+				int32_t exponent = extent > 0.0f ? (int32_t)ceilf(log2f(extent / 255.0f)) : -126;
+				// clamp into int8_t range
+				exponent = tinybvh_clamp(exponent, -126, 127);
+				// guard against ceil rounding "extent" below the real extent
+				// indirectly by giving exponent too small of a value
+				if (exponent < 127 && ldexpf(255.0f, exponent) < extent)
+					exponent++;
+				currDobbNode.exponent[axisIdx] = (int8_t)exponent;
+				// calculate inverseScale here, once
+				inverseScale[axisIdx] = ldexpf(1.0f, -exponent);
+			}
+
+			uint32_t currDobbNodeChildBaseIdx = 0;
+			uint32_t currDobbNodeInternalChildCount = 0;
+			uint32_t currDobbNodeTriCount = 0;
+
+			// Fill rest of the data for the compressed nodes
+			for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++) {
+				// Fill qLo and qHi
+				for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++) {
+					const float currQLo = floorf((childMinPoint[childIdx][axisIdx] - minPoint[axisIdx]) * inverseScale[axisIdx]);
+					currDobbNode.qLo[axisIdx][childIdx] = (uint8_t)tinybvh_clamp(currQLo, 0.0f, 255.0f);
+				
+					const float currQHi = ceilf((childMaxPoint[childIdx][axisIdx] - minPoint[axisIdx]) * inverseScale[axisIdx]);
+					currDobbNode.qHi[axisIdx][childIdx] = (uint8_t)tinybvh_clamp(currQHi, 0.0f, 255.0f);
+				}
+
+				uint32_t currChildIdx = currBvhNode.child[childIdx];
+				const auto& currChild = bvh8.mbvhNode[currChildIdx];
+
+				// Pack internal child nodes
+				if (!currChild.isLeaf())
+				{
+					// Set base index if its the first internal child
+					// dobbNodeIdx holds the next available dobb node
+					if (currDobbNodeInternalChildCount++ == 0)
+						currDobbNodeChildBaseIdx = dobbNodeIdx;
+
+					// Add next index pair to stack
+					stackBvhNodes[stackIdx] = currChildIdx;
+					stackDobbNodes[stackIdx++] = dobbNodeIdx++;
+
+					currDobbNode.iMask |= (uint8_t)(1 << childIdx);
+					currDobbNode.meta[childIdx] = (uint8_t)(0b00100000 | (24 + childIdx));
+				}
+				// Pack leaf child nodes
+				else
+				{
+					// Set base index if it is the first leaf child
+					// dobbTriIdx holds the next available triangle
+					if (currDobbNodeTriCount == 0)
+						currDobbNode.triBaseIndex = dobbTriIdx;
+
+					// Pack meta
+					const uint8_t unaryTriCount = currChild.triCount == 1 ? 0b001 : 0b011;
+					currDobbNode.meta[childIdx] = (uint8_t)((unaryTriCount << 5) | currDobbNodeTriCount);
+
+					// Increment tri count
+					currDobbNodeTriCount += currChild.triCount;
+
+					// Copy triangle indices into dobbPrimIdx in the correct
+					// order 
+					for (uint32_t triIdx = 0; triIdx < currChild.triCount; triIdx++)
+						dobbPrimIdx[dobbTriIdx++] = bvh8.bvh.primIdx[currChild.firstTri + triIdx];
+				}
+			}
+
+			// Set child base index and rotation in dobb node
+			currDobbNode.SetChildBaseIndexRotation(currDobbNodeChildBaseIdx, chosenRotation);
 		}
+
+		usedNodes = dobbNodeIdx;
 	}
 
 } // namespace tinybvh
