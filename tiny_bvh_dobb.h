@@ -233,6 +233,12 @@ namespace tinybvh {
 
 		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } // TODO: add layout
 		~BVH_DOBB();
+
+		void Build(const bvhvec4* vertices, const uint32_t primCount);
+		void Build(const bvhvec4slice& vertices);
+		void Build(const bvhvec4* vertices, const uint32_t* indices, const uint32_t primCount);
+		void Build(const bvhvec4slice& vertices, const uint32_t* indices, const uint32_t primCount);
+
 		void ConvertFrom(const MBVH<8>& original);
 
 		// BVH data
@@ -263,6 +269,32 @@ namespace tinybvh {
 		AlignedFree(dobbPrimIdx);
 		
 		AlignedFree(sideband);
+	}
+
+	void BVH_DOBB::Build(const bvhvec4* vertices, const uint32_t primCount) {
+		Build(bvhvec4slice(vertices, primCount * 3, sizeof(bvhvec4)), 0, 0);
+	}
+
+	void BVH_DOBB::Build(const bvhvec4slice& vertices) {
+		Build(vertices, 0, 0);
+	}
+
+	void BVH_DOBB::Build(const bvhvec4* vertices, const uint32_t* indices, const uint32_t primCount) {
+		Build(bvhvec4slice(vertices, primCount * 3, sizeof(bvhvec4)), indices, primCount);
+	}
+
+	void BVH_DOBB::Build(const bvhvec4slice& vertices, const uint32_t* indices, const uint32_t primCount) {
+		// make sure we own bvh8 (a previous ConvertFrom may have left it referencing someone else's)
+		if (!ownBVH8) bvh8.DropReference(context), ownBVH8 = true;
+		bvh8.bvh.context = context;
+		// Build binary BVH
+		bvh8.bvh.Build(vertices, indices, primCount);
+		// DOBB leaves can hold only up to 2 triangles
+		bvh8.bvh.SplitLeafs(2);
+		// Create 8 wide BVH
+		bvh8.ConvertFrom(bvh8.bvh, true);
+		// Create oriented tree
+		ConvertFrom(bvh8);
 	}
 
 	void BVH_DOBB::ConvertFrom(const MBVH<8>& original)
