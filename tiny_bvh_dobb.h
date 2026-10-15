@@ -8,6 +8,10 @@
 #define AXESNO 13
 #define SMALLM 4
 
+#ifndef FATAL_ERROR_IF
+#define FATAL_ERROR_IF(condition, message) if (condition) { fprintf( stderr, "Fatal error in tiny_bvh_dobb.h, line %i:\n%s\n", __LINE__, message ); exit( 1 ); }
+#endif
+
 // TODO: General refactor:
 //	- use const consistently
 //  - remove uneccessary declaration
@@ -239,6 +243,7 @@ namespace tinybvh {
 		void Build(const bvhvec4* vertices, const uint32_t* indices, const uint32_t primCount);
 		void Build(const bvhvec4slice& vertices, const uint32_t* indices, const uint32_t primCount);
 
+		// Leaves can have at most two triangles in them!
 		void ConvertFrom(const MBVH<8>& original);
 
 		// BVH data
@@ -306,6 +311,9 @@ namespace tinybvh {
 			else bvh8.DropReference(context);
 			ownBVH8 = false;
 		}
+		// ConvertFrom does not handle cases where there are 2 or less primitives
+		FATAL_ERROR_IF(bvh8.usedNodes == 0, "BVH_DOBB::ConvertFrom( .. ), source MBVH is empty.");
+		FATAL_ERROR_IF(bvh8.mbvhNode[0].isLeaf(), "BVH_DOBB::ConvertFrom( .. ), root is a leaf (scene has 2 triangles or fewer).");
 		bvh8.ReferenceFrom(original);
 		// get base properties
 		CopyBasePropertiesFrom(bvh8);
@@ -498,8 +506,8 @@ namespace tinybvh {
 
 				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
-				float bestSim = 0.0f;
-				sideband[nodeIdx].rotation = 255;
+				float bestSim = -1.0f;
+				sideband[nodeIdx].rotation = 0;
 				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
 					float sim = lut.similarity({ a0, a1, a2 }, rotationIdx);
 					if (sim > bestSim) {
@@ -785,6 +793,9 @@ namespace tinybvh {
 		}
 
 		usedNodes = dobbNodeIdx;
+
+		AlignedFree(sideband);
+		sideband = 0;
 	}
 
 } // namespace tinybvh
