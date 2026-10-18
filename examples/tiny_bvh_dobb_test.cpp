@@ -167,15 +167,37 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 // ---------------------- LOAD DATA ----------------------
 
 // Scene management - Append a file, with optional position, scale and color override, tinyfied
-void AddMesh(const char* file, float scale = 1, bvhvec3 pos = {}, int c = 0, int N = 0)
+void AddMesh(const char* file, float scale = 1, bvhvec3 pos = {}, int c = 0,
+	bvhvec3 rotationAxis = bvhvec3(0, 1, 0), float rotationDegrees = 0.0f)
 {
 	std::fstream s{ file, s.binary | s.in };
+	int N = 0;
 	s.read((char*)&N, 4);
 	bvhvec4* data = (bvhvec4*)malloc64((N + triCount) * 48);
 	if (tris) memcpy(data, tris, triCount * 48), free64(tris);
 	tris = data, s.read((char*)tris + triCount * 48, N * 48), triCount += N;
-	for (int* b = (int*)tris + (triCount - N) * 12, i = 0; i < N * 3; i++)
-		*(bvhvec3*)b = *(bvhvec3*)b * scale + pos, b[3] = c ? c : b[3], b += 4;
+	
+	rotationAxis = tinybvh_normalize(rotationAxis);
+	const float angle = rotationDegrees * (3.14159265f / 180.0f);
+	const float cosAngle = cosf(angle);
+	const float sinAngle = sinf(angle);
+
+	for (int vertexIdx = (triCount - N) * 3; vertexIdx < triCount * 3; vertexIdx++) {
+		bvhvec4& vertex = tris[vertexIdx];
+		// Scale vertex position
+		bvhvec3 vertPos = bvhvec3(vertex) * scale;
+		// Rotate vertex position 
+		vertPos = vertPos * cosAngle
+			+ tinybvh_cross(rotationAxis, vertPos) * sinAngle
+			+ rotationAxis * (tinybvh_dot(rotationAxis, vertPos) * (1.0f - cosAngle));
+		// Add pos, to get world position
+		vertPos = vertPos + pos;
+
+		vertex.x = vertPos.x;
+		vertex.y = vertPos.y;
+		vertex.z = vertPos.z;
+		if (c) *(int*)&vertex.w = c;
+	}
 }
 
 void ClearMesh()
@@ -267,7 +289,8 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			ClearMesh();
 			AddMesh(
 				meshLocations[meshIdx], 
-				1, bvhvec3(0), 0xffffff
+				1, bvhvec3(0), 0xffffff,
+				bvhvec3(0.0f, 1.0f, 0.0f), 45.0f 
 			);
 			std::cout << "Building BVHs" << std::endl;
 			// Build BVHs 
