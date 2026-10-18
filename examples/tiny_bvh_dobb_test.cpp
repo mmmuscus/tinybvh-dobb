@@ -45,8 +45,7 @@ static float renderLength = 20.0f;
 // Application variables
 static uint64_t cost = 0;
 static BVH baseBvh;
-// TODO: replace with actual DOBB class
-static BVH dobbBvh;
+static BVH_DOBB dobbBvh;
 static bvhvec4* tris = 0;
 static int triCount = 0, spp = 0;
 static bvhvec3 accumulator[SCRWIDTH * SCRHEIGHT];
@@ -197,10 +196,10 @@ void ClearMesh()
 void InitBvhs() 
 {
 	baseBvh.Build(tris, triCount);
-	baseBvh.c_trav = 1.0, baseBvh.c_int = 1.0;
-	// TODO: replace w actual dobb class
-	dobbBvh.BuildHQ(tris, triCount);
-	dobbBvh.c_trav = 1.0, dobbBvh.c_int = 1.0;
+	baseBvh.c_trav = 1.0, baseBvh.c_int = 0.0;
+	
+	dobbBvh.Build(tris, triCount);
+	dobbBvh.c_trav = 1.0, dobbBvh.c_int = 0.0;
 }
 
 // ---------------------- MISC ----------------------
