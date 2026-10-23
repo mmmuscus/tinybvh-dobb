@@ -265,7 +265,11 @@ namespace tinybvh {
 		bool ownBVH8 = true;
 
 		sidebandData* sideband = 0;
+
+	private:
 		static DOBB_LUT lut;
+
+		void calcBasisVectorsForBFromTri(const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2);
 };
 
 } // namespace tinybvh
@@ -371,35 +375,8 @@ namespace tinybvh {
 					leafVerts[1] = bvh8.bvh.verts[i1];
 					leafVerts[2] = bvh8.bvh.verts[i2];
 
-					// TODO: Create helper function to copy in the non-quad triCount == 2 case
-					// Determine a0 and a1 for B
-					// Determine longest edge of triangle => find 
-					// "middle point" of shortest edges
-					const bvhvec3 edges[3] = {
-						leafVerts[1] - leafVerts[0], // (v0, v1) = e0
-						leafVerts[2] - leafVerts[1], // (v1, v2) = e1
-						leafVerts[0] - leafVerts[2]  // (v2, v0) = e2
-					};
-					// Get lengths
-					const float lengthsSqd[3] = {
-						tinybvh_dot(edges[0], edges[0]),
-						tinybvh_dot(edges[1], edges[1]),
-						tinybvh_dot(edges[2], edges[2])
-					};
-
-					uint32_t longestIdx = lengthsSqd[0] > lengthsSqd[1] ? 0 : 1;
-					if (lengthsSqd[2] > lengthsSqd[longestIdx]) longestIdx = 2;
-
-					uint32_t midPointIdx = (longestIdx + 2) % 3;
-
-					if (lengthsSqd[midPointIdx] < lengthsSqd[(midPointIdx + 2) % 3]) {
-						a0 = edges[midPointIdx];
-						a1 = -edges[(midPointIdx + 2) % 3];
-					}
-					else {
-						a0 = -edges[(midPointIdx + 2) % 3];
-						a1 = edges[midPointIdx];
-					}
+					// Determine B
+					calcBasisVectorsForBFromTri(leafVerts, a0, a1, a2);
 				}
 				// Implicitly, leaf has 2 triangles
 				else
@@ -443,39 +420,14 @@ namespace tinybvh {
 
 					// Check if triangles share an edge 
 					if (sharedVert2[0] == 6) {
-						// TODO: handle case where triangles share exactly 1 vertex
-						// This case will be selected if the triangles match
-						// in at most one vertex, thus here there is a wasted
-						// projection
+						calcBasisVectorsForBFromTri(leafVerts, a0, a1, a2);
+
+						// Skip the extra branch by setting a default value
 						noLeafVerts = 6;
-
-						// Determine a0 and a1 for B
-						// Determine longest edge of triangle => find 
-						// "middle point" of shortest edges
-						const bvhvec3 edges[3] = {
-							leafVerts[1] - leafVerts[0], // (v0, v1) = e0
-							leafVerts[2] - leafVerts[1], // (v1, v2) = e1
-							leafVerts[0] - leafVerts[2]  // (v2, v0) = e2
-						};
-						// Get lengths
-						const float lengthsSqd[3] = {
-							tinybvh_dot(edges[0], edges[0]),
-							tinybvh_dot(edges[1], edges[1]),
-							tinybvh_dot(edges[2], edges[2])
-						};
-
-						uint32_t longestIdx = lengthsSqd[0] > lengthsSqd[1] ? 0 : 1;
-						if (lengthsSqd[2] > lengthsSqd[longestIdx]) longestIdx = 2;
-
-						uint32_t midPointIdx = (longestIdx + 2) % 3;
-
-						if (lengthsSqd[midPointIdx] < lengthsSqd[(midPointIdx + 2) % 3]) {
-							a0 = edges[midPointIdx];
-							a1 = -edges[(midPointIdx + 2) % 3];
-						}
-						else {
-							a0 = -edges[(midPointIdx + 2) % 3];
-							a1 = edges[midPointIdx];
+						// Determine if the two triangles consist of 5 or 6 vertices
+						if (sharedVert1[0] != 6) {
+							leafVerts[sharedVert1[1]] = leafVerts[5];
+							noLeafVerts = 5;
 						}
 					}
 					else {
@@ -507,20 +459,20 @@ namespace tinybvh {
 						// the "middle" vertex is in the shared edge
 						a0 = leafVerts[0] - leafVerts[1];
 						a1 = leafVerts[3] - leafVerts[1];
+
+						// Calculate B
+						a0 = tinybvh_normalize(a0);
+						a2 = tinybvh_normalize(tinybvh_cross(a0, a1));
+						a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
 					}
 				}
-
-				// Calculate B
-				a0 = tinybvh_normalize(a0);
-				a2 = tinybvh_normalize(tinybvh_cross(a0, a1));
-				a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
 
 				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
 				float bestSim = -1.0f;
 				sideband[nodeIdx].rotation = 0;
 				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
-					float sim = lut.similarity({ a0, a1, a2 }, rotationIdx);
+					float sim = lut.similarity({a0, a1, a2}, rotationIdx);
 					if (sim > bestSim) {
 						bestSim = sim;
 						sideband[nodeIdx].rotation = rotationIdx;
@@ -731,7 +683,7 @@ namespace tinybvh {
 			// Quantize extent of current bounding box
 			for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++) {
 				const float extent = maxPoint[axisIdx] - minPoint[axisIdx];
-				// guard against in-plane BBs
+				// guard against in-plan BBs
 				int32_t exponent = extent > 0.0f ? (int32_t)ceilf(log2f(extent / 255.0f)) : -126;
 				// clamp into int8_t range
 				exponent = tinybvh_clamp(exponent, -126, 127);
@@ -751,14 +703,26 @@ namespace tinybvh {
 			// Fill rest of the data for the compressed nodes
 			for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++) {
 				// Fill qLo and qHi
-				// TODO: unroll!
-				for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++) {
-					const float currQLo = floorf((childMinPoint[childIdx][axisIdx] - minPoint[axisIdx]) * inverseScale[axisIdx]);
-					currDobbNode.qLo[axisIdx][childIdx] = (uint8_t)tinybvh_clamp(currQLo, 0.0f, 255.0f);
-				
-					const float currQHi = ceilf((childMaxPoint[childIdx][axisIdx] - minPoint[axisIdx]) * inverseScale[axisIdx]);
-					currDobbNode.qHi[axisIdx][childIdx] = (uint8_t)tinybvh_clamp(currQHi, 0.0f, 255.0f);
-				}
+				// Fill qLo 
+				currDobbNode.qLo[0][childIdx] = (uint8_t)tinybvh_clamp(
+					floorf((childMinPoint[childIdx][0] - minPoint[0]) * inverseScale[0]),
+					0.0f, 255.0f);
+				currDobbNode.qLo[1][childIdx] = (uint8_t)tinybvh_clamp(
+					floorf((childMinPoint[childIdx][1] - minPoint[1]) * inverseScale[1]),
+					0.0f, 255.0f);
+				currDobbNode.qLo[2][childIdx] = (uint8_t)tinybvh_clamp(
+					floorf((childMinPoint[childIdx][2] - minPoint[2]) * inverseScale[2]),
+					0.0f, 255.0f);
+				// Fill qHi
+				currDobbNode.qHi[0][childIdx] = (uint8_t)tinybvh_clamp(
+					ceilf((childMaxPoint[childIdx][0] - minPoint[0]) - inverseScale[0]),
+					0.0f, 255.0f);
+				currDobbNode.qHi[1][childIdx] = (uint8_t)tinybvh_clamp(
+					ceilf((childMaxPoint[childIdx][1] - minPoint[1]) - inverseScale[1]),
+					0.0f, 255.0f);
+				currDobbNode.qHi[2][childIdx] = (uint8_t)tinybvh_clamp(
+					ceilf((childMaxPoint[childIdx][2] - minPoint[2]) - inverseScale[2]),
+					0.0f, 255.0f);
 
 				uint32_t currChildIdx = currBvhNode.child[childIdx];
 				const auto& currChild = bvh8.mbvhNode[currChildIdx];
@@ -808,6 +772,41 @@ namespace tinybvh {
 
 		AlignedFree(sideband);
 		sideband = 0;
+	}
+
+	void BVH_DOBB::calcBasisVectorsForBFromTri(const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2) {
+		// Determine longest edge of triangle => find 
+		// "middle point" of shortest edges
+		const bvhvec3 edges[3] = {
+						triVerts[1] - triVerts[0], // (v0, v1) = e0
+						triVerts[2] - triVerts[1], // (v1, v2) = e1
+						triVerts[0] - triVerts[2]  // (v2, v0) = e2
+		};
+		// Get lengths
+		const float lengthsSqd[3] = {
+			tinybvh_dot(edges[0], edges[0]),
+			tinybvh_dot(edges[1], edges[1]),
+			tinybvh_dot(edges[2], edges[2])
+		};
+
+		uint32_t longestIdx = lengthsSqd[0] > lengthsSqd[1] ? 0 : 1;
+		if (lengthsSqd[2] > lengthsSqd[longestIdx]) longestIdx = 2;
+
+		uint32_t midPointIdx = (longestIdx + 2) % 3;
+
+		if (lengthsSqd[midPointIdx] < lengthsSqd[(midPointIdx + 2) % 3]) {
+			a0 = edges[midPointIdx];
+			a1 = -edges[(midPointIdx + 2) % 3];
+		}
+		else {
+			a0 = -edges[(midPointIdx + 2) % 3];
+			a1 = edges[midPointIdx];
+		}
+
+		// Calculate B
+		a0 = tinybvh_normalize(a0);
+		a2 = tinybvh_normalize(tinybvh_cross(a0, a1));
+		a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
 	}
 
 	int32_t BVH_DOBB::Intersect(Ray& ray) const {
