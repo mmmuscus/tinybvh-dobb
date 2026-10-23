@@ -266,9 +266,10 @@ namespace tinybvh {
 
 		sidebandData* sideband = 0;
 
-	private:
+		// TODO: make lut private again
 		static DOBB_LUT lut;
 
+	private:
 		void calcBasisVectorsForBFromTri(const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2);
 };
 
@@ -715,13 +716,13 @@ namespace tinybvh {
 					0.0f, 255.0f);
 				// Fill qHi
 				currDobbNode.qHi[0][childIdx] = (uint8_t)tinybvh_clamp(
-					ceilf((childMaxPoint[childIdx][0] - minPoint[0]) - inverseScale[0]),
+					ceilf((childMaxPoint[childIdx][0] - minPoint[0]) * inverseScale[0]),
 					0.0f, 255.0f);
 				currDobbNode.qHi[1][childIdx] = (uint8_t)tinybvh_clamp(
-					ceilf((childMaxPoint[childIdx][1] - minPoint[1]) - inverseScale[1]),
+					ceilf((childMaxPoint[childIdx][1] - minPoint[1]) * inverseScale[1]),
 					0.0f, 255.0f);
 				currDobbNode.qHi[2][childIdx] = (uint8_t)tinybvh_clamp(
-					ceilf((childMaxPoint[childIdx][2] - minPoint[2]) - inverseScale[2]),
+					ceilf((childMaxPoint[childIdx][2] - minPoint[2]) * inverseScale[2]),
 					0.0f, 255.0f);
 
 				uint32_t currChildIdx = currBvhNode.child[childIdx];
