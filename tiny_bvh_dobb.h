@@ -19,9 +19,24 @@
 // TODO: General refactor:
 //	- use const consistently
 //  - remove uneccessary declaration
-//	- you can index bvhvec3-s, use it where its useful!
+//	- you can index bvhvec3-s, use it where its useful
 
 namespace tinybvh {
+	// For instrumentation for experiment
+	struct TraversalStats {
+		uint64_t rayCount = 0;
+		uint64_t nodeVisits = 0;
+		uint64_t boxTests = 0;
+		uint64_t triTests = 0;
+
+		void add(const TraversalStats& other) {
+			rayCount += other.rayCount;
+			nodeVisits += other.nodeVisits;
+			boxTests += other.boxTests;
+			triTests += other.triTests;
+		}
+	};
+
 	static const bvhvec3 proxyKDopAxes[AXESNO] = {
 		// 3 Euclidian axes
 		bvhvec3(1.0f, 0.0f, 0.0f),
@@ -304,8 +319,8 @@ namespace tinybvh {
 		// Leaves can have at most two triangles in them!
 		void ConvertFrom(const MBVH<8>& original);
 
-		int32_t Intersect(Ray& ray) const;
-		bool IsOccluded(const Ray& ray) const;
+		int32_t Intersect(Ray& ray, TraversalStats* stats = nullptr) const;
+		bool IsOccluded(const Ray& ray, TraversalStats* stats = nullptr) const;
 
 		// BVH data
 		BVHNode* dobbNode = 0;
@@ -853,7 +868,7 @@ namespace tinybvh {
 		a1 = tinybvh_normalize(tinybvh_cross(a2, a0)); // normalized for safety
 	}
 
-	int32_t BVH_DOBB::Intersect(Ray& ray) const {
+	int32_t BVH_DOBB::Intersect(Ray& ray, TraversalStats* stats) const {
 		int32_t traversalSteps = 0;
 
 		uint32_t nodeStack[512];
@@ -862,6 +877,7 @@ namespace tinybvh {
 
 		while (stackIdx > 0) {
 			traversalSteps += (uint32_t)c_trav;
+			if (stats) stats->nodeVisits++;
 
 			const uint32_t currNodeIdx = nodeStack[--stackIdx];
 			const BVHNode& currNode = dobbNode[currNodeIdx];
@@ -903,6 +919,8 @@ namespace tinybvh {
 			uint32_t remainingSlots = currNode.OccupiedMask();
 
 			while (remainingSlots) {
+				if (stats) stats->boxTests++;
+
 				// Determine which is the next slot to process
 				uint32_t slot = (uint32_t)std::countr_zero(remainingSlots);
 				remainingSlots &= remainingSlots - 1;
@@ -940,6 +958,8 @@ namespace tinybvh {
 
 				uint32_t i0, i1, i2;
 				for (uint32_t triIdx = 0; triIdx < triCount; triIdx++) {
+					if (stats) stats->triTests++;
+
 					const uint32_t primIdx = dobbPrimIdx[firstTri + triIdx];
 					GET_PRIM_INDICES_I0_I1_I2(bvh8.bvh, primIdx);
 					IntersectTri(ray, primIdx, bvh8.bvh.verts, i0, i1, i2);
@@ -960,7 +980,7 @@ namespace tinybvh {
 		return traversalSteps;
 	}
 
-	bool BVH_DOBB::IsOccluded(const Ray& ray) const {
+	bool BVH_DOBB::IsOccluded(const Ray& ray, TraversalStats* stats) const {
 		uint32_t nodeStack[512];
 		uint32_t stackIdx = 0;
 		nodeStack[stackIdx++] = 0;
@@ -1043,6 +1063,8 @@ namespace tinybvh {
 
 				uint32_t i0, i1, i2;
 				for (uint32_t triIdx = 0; triIdx < triCount; triIdx++) {
+					if (stats) stats->triTests++;
+
 					const uint32_t primIdx = dobbPrimIdx[firstTri + triIdx];
 					GET_PRIM_INDICES_I0_I1_I2(bvh8.bvh, primIdx);
 					if(TriOccludes(ray, bvh8.bvh.verts, primIdx, i0, i1, i2))
