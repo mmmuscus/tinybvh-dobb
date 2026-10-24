@@ -38,6 +38,14 @@ namespace tinybvh {
 		tinybvh_normalize(bvhvec3(1.0f, -1.0f, -1.0f)),
 	};
 
+	// Only implementing |K| = 13 case
+	struct dobbSidebandData {
+		// Index corresponds to axes
+		bvhvec2 kDopExtents[AXESNO];
+		uint8_t rotation;
+		float AABBSASum;
+	};
+
 	// TODO: indirection of LUT
 	class DOBB_LUT {
 	public: 
@@ -233,16 +241,6 @@ namespace tinybvh {
 			uint8_t LeafMask() const { return OccupiedMask() & ~iMask; }
 		};
 
-		// TODO: move outside of class
-		// Only implementing |K| = 13 case
-		struct sidebandData
-		{
-			// Index corresponds to axes
-			bvhvec2 kDopExtents[AXESNO];
-			uint8_t rotation;
-			float AABBSASum;
-		};
-
 		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } // TODO: add layout
 		~BVH_DOBB();
 
@@ -263,8 +261,6 @@ namespace tinybvh {
 		uint32_t allocatedPrimIndices = 0;
 		MBVH<8> bvh8;
 		bool ownBVH8 = true;
-
-		sidebandData* sideband = 0;
 
 		// TODO: make lut private again
 		static DOBB_LUT lut;
@@ -288,8 +284,6 @@ namespace tinybvh {
 		if (!ownBVH8) bvh8.ReleaseOwnership();
 		AlignedFree(dobbNode);
 		AlignedFree(dobbPrimIdx);
-		
-		AlignedFree(sideband);
 	}
 
 	void BVH_DOBB::Build(const bvhvec4* vertices, const uint32_t primCount) {
@@ -333,9 +327,10 @@ namespace tinybvh {
 		bvh8.ReferenceFrom(original);
 		// get base properties
 		CopyBasePropertiesFrom(bvh8);
+
 		// Allocate proxy k-DOPs and rotation sideband data
-		AlignedFree(sideband);
-		sideband = (sidebandData*)AlignedAlloc(bvh8.usedNodes * sizeof(sidebandData));
+		dobbSidebandData* sideband;
+		sideband = (dobbSidebandData*)AlignedAlloc(bvh8.usedNodes * sizeof(dobbSidebandData));
 
 		// Count the number of interior nodes in bvh8, DOBB BVH needs this
 		// amount of nodes in total
@@ -619,13 +614,10 @@ namespace tinybvh {
 					if (reprojection.sign[2] == 1)
 						h2 = sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].y;
 					else h2 = -sideband[currChildIdx].kDopExtents[reprojection.axisIdx[2]].x;
-					// TODO: Remove unnecessary variable declarations after confirming it works correctly
 					// Determine apex point by finding intersection of three planes
 					// Find vectors colinear with the intersection of pairwise planes
 					bvhvec3 c0 = tinybvh_cross(v1, v2);
-					bvhvec3 c1 = tinybvh_cross(v2, v0);
-					bvhvec3 c2 = tinybvh_cross(v0, v1);
-					apexPoint = (c0 * h0 + c1 * h1 + c2 * h2) / tinybvh_dot(v0, c0);
+					apexPoint = (c0 * h0 + tinybvh_cross(v2, v0) * h1 + tinybvh_cross(v0, v1) * h2) / tinybvh_dot(v0, c0);
 					// Determine axis extent by projecting apex point onto the axis
 					rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot(rotatedAxes[rotatedAxesIdx], apexPoint);
 				}
