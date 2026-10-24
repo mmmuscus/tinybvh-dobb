@@ -7,10 +7,14 @@
 
 #define AXESNO 13
 #define SMALLM 4
+#define MAXROTATIONVALUES 44
 
 #ifndef FATAL_ERROR_IF
 #define FATAL_ERROR_IF(condition, message) if (condition) { fprintf( stderr, "Fatal error in tiny_bvh_dobb.h, line %i:\n%s\n", __LINE__, message ); exit( 1 ); }
 #endif
+
+#include <iostream>
+#include <stdio.h>
 
 // TODO: General refactor:
 //	- use const consistently
@@ -46,17 +50,18 @@ namespace tinybvh {
 		float AABBSASum;
 	};
 
-	// TODO: indirection of LUT
 	class DOBB_LUT {
 	public: 
-		struct Mat3 { float m[3][3]; };
+		struct Mat3f { float m[3][3]; };
+		struct Mat3i { uint8_t m[3][3]; };
 
 		struct reprojectionEntry {
 			uint8_t axisIdx[3];
 			int sign[3];
 		};
 
-		Mat3 rotations[AXESNO * SMALLM * 2];
+		float rotationValues[MAXROTATIONVALUES];
+		Mat3i rotations[AXESNO * SMALLM * 2];
 		reprojectionEntry reprojections[AXESNO * SMALLM * 2][6];
 
 		DOBB_LUT() { 
@@ -64,11 +69,30 @@ namespace tinybvh {
 			buildReprojectionLUT();
 		}
 
+		Mat3f getRawEntry(uint32_t rotIdx) {
+			Mat3f ret;
+			Mat3i rotMat = rotations[rotIdx];
+
+			ret.m[0][0] = rotationValues[rotMat.m[0][0]];
+			ret.m[0][1] = rotationValues[rotMat.m[0][1]];
+			ret.m[0][2] = rotationValues[rotMat.m[0][2]];
+
+			ret.m[1][0] = rotationValues[rotMat.m[1][0]];
+			ret.m[1][1] = rotationValues[rotMat.m[1][1]];
+			ret.m[1][2] = rotationValues[rotMat.m[1][2]];
+
+			ret.m[2][0] = rotationValues[rotMat.m[2][0]];
+			ret.m[2][1] = rotationValues[rotMat.m[2][1]];
+			ret.m[2][2] = rotationValues[rotMat.m[2][2]];
+
+			return ret;
+		}
+
 		const float similarity(const bvhvec3 (&capitalB)[3], const uint32_t rotIdx) {
-			const Mat3 rotMat = rotations[rotIdx];
+			const Mat3f rotMat = getRawEntry(rotIdx);
 			// Using dot product, set up matrix that we can use to compare
 			// all possible permutations of bases
-			Mat3 dotMat;
+			Mat3f dotMat;
 
 			for (uint32_t i = 0; i < 3; i++) {
 				const bvhvec3 r(rotMat.m[0][i], rotMat.m[1][i], rotMat.m[2][i]);
@@ -91,13 +115,14 @@ namespace tinybvh {
 		}
 
 	private:
+
 		// https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
 		// axis must be normalized
-		static Mat3 rodriguesRotMat(bvhvec3 axis, float angle) {
+		static Mat3f rodriguesRotMat(bvhvec3 axis, float angle) {
 			const float cs = cosf(angle);
 			const float oneMinusCos = 1 - cs;
 			const float sn = sinf(angle);
-			Mat3 ret;
+			Mat3f ret;
 
 			ret.m[0][0] = cs + oneMinusCos * axis.x * axis.x;
 			ret.m[0][1] = oneMinusCos * axis.x * axis.y - sn * axis.z;
@@ -118,19 +143,46 @@ namespace tinybvh {
 			const float delta = 3.14159265358979f / (2.0f * SMALLM);
 			uint32_t rotationsIdx = 0;
 
-			for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) 
+			Mat3f rawRotations[AXESNO * SMALLM * 2];
+
+			// Calculate raw rotation matrix values
+			for (uint32_t axisIdx = 0; axisIdx < AXESNO; axisIdx++) {
 				for (int i = 1; i <= SMALLM; i++) {
-					rotations[rotationsIdx++] = rodriguesRotMat(
+					rawRotations[rotationsIdx++] = rodriguesRotMat(
 						proxyKDopAxes[axisIdx], i * delta);
 
-					rotations[rotationsIdx++] = rodriguesRotMat(
+					rawRotations[rotationsIdx++] = rodriguesRotMat(
 						proxyKDopAxes[axisIdx], i * -delta);
 				}
+			}
+
+			uint8_t rotValUsed = 0;
+			for (uint32_t rotIdx = 0; rotIdx < AXESNO * SMALLM * 2; rotIdx++) {
+				for (uint32_t rowIdx = 0; rowIdx < 3; rowIdx++) {
+					for (uint32_t colIdx = 0; colIdx < 3; colIdx++) {
+						bool found = false;
+						const float currRawValue = rawRotations[rotIdx].m[rowIdx][colIdx];
+
+						for (uint8_t rotValIdx = 0; rotValIdx < rotValUsed; rotValIdx++) {
+							if (fabsf(rotationValues[rotValIdx] - currRawValue) < 0.000001f) {
+								found = true;
+								rotations[rotIdx].m[rowIdx][colIdx] = rotValIdx;
+								break;
+							}
+						}
+
+						if (!found) {
+							rotationValues[rotValUsed] = currRawValue;
+							rotations[rotIdx].m[rowIdx][colIdx] = rotValUsed++;
+						}
+					}
+				}
+			}
 		}
 
 		void buildReprojectionLUT() {
 			for (uint32_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
-				const Mat3& rotation = rotations[rotationIdx];
+				const Mat3f& rotation = getRawEntry(rotationIdx);
 				for (uint32_t candidateRotAxisIdx = 0; candidateRotAxisIdx < 3; candidateRotAxisIdx++) {
 					const bvhvec3 candidateAxis(
 						rotation.m[0][candidateRotAxisIdx],
@@ -262,10 +314,9 @@ namespace tinybvh {
 		MBVH<8> bvh8;
 		bool ownBVH8 = true;
 
-		// TODO: make lut private again
+	private:
 		static DOBB_LUT lut;
 
-	private:
 		void calcBasisVectorsForBFromTri(const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2);
 };
 
@@ -569,7 +620,7 @@ namespace tinybvh {
 			memset(&currDobbNode, 0, sizeof(BVHNode));
 
 			uint8_t candidateRotationIdx = sideband[currBvhIdx].rotation;
-			DOBB_LUT::Mat3 candidateRotation = lut.rotations[candidateRotationIdx];
+			DOBB_LUT::Mat3f candidateRotation = lut.getRawEntry(candidateRotationIdx);
 
 			// Collect basis vectors of current rotation
 			bvhvec3 rotatedAxes[6] = {
@@ -820,7 +871,7 @@ namespace tinybvh {
 			const uint32_t rotationIdx = currNode.Rotation();
 
 			if (rotationIdx != 255) {
-				const DOBB_LUT::Mat3& rotation = lut.rotations[rotationIdx];
+				const DOBB_LUT::Mat3f& rotation = lut.getRawEntry(rotationIdx);
 
 				const bvhvec3 rotationX = bvhvec3(rotation.m[0][0], rotation.m[1][0], rotation.m[2][0]);
 				const bvhvec3 rotationY = bvhvec3(rotation.m[0][1], rotation.m[1][1], rotation.m[2][1]);
@@ -923,7 +974,7 @@ namespace tinybvh {
 			const uint32_t rotationIdx = currNode.Rotation();
 
 			if (rotationIdx != 255) {
-				const DOBB_LUT::Mat3& rotation = lut.rotations[rotationIdx];
+				const DOBB_LUT::Mat3f& rotation = lut.getRawEntry(rotationIdx);
 
 				const bvhvec3 rotationX = bvhvec3(rotation.m[0][0], rotation.m[1][0], rotation.m[2][0]);
 				const bvhvec3 rotationY = bvhvec3(rotation.m[0][1], rotation.m[1][1], rotation.m[2][1]);
