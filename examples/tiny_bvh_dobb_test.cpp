@@ -51,6 +51,239 @@ static int triCount = 0, spp = 0;
 static bvhvec3 accumulator[SCRWIDTH * SCRHEIGHT];
 static std::atomic<int> tileIdx(0);
 
+// ---------------------- INSTRUMENTATION ----------------------
+
+// Same signature and behaviour as BVHBase::IntersectTri (Möller–Trumbore, no opacity maps)
+static void IntersectTri(Ray& ray, const uint32_t triIdx, const bvhvec4slice& verts,
+	const uint32_t i0, const uint32_t i1, const uint32_t i2)
+{
+	const bvhvec3 vertex0 = bvhvec3(verts[i0]);
+	const bvhvec3 edge1 = bvhvec3(verts[i1]) - vertex0, edge2 = bvhvec3(verts[i2]) - vertex0;
+	const bvhvec3 directionCrossEdge2 = tinybvh_cross(ray.D, edge2);
+	const float determinant = tinybvh_dot(edge1, directionCrossEdge2);
+	if (determinant == 0.0f) return;
+	const float inverseDeterminant = 1.0f / determinant;
+	const bvhvec3 originOffset = ray.O - vertex0;
+	const float baryU = inverseDeterminant * tinybvh_dot(originOffset, directionCrossEdge2);
+	const bvhvec3 offsetCrossEdge1 = tinybvh_cross(originOffset, edge1);
+	const float baryV = inverseDeterminant * tinybvh_dot(ray.D, offsetCrossEdge1);
+	if (!(baryU >= 0.0f && baryV >= 0.0f && baryU + baryV <= 1.0f)) return;
+	const float distance = inverseDeterminant * tinybvh_dot(edge2, offsetCrossEdge1);
+	if (!(distance >= 0.0f && distance <= ray.hit.t)) return;
+	ray.hit.t = distance, ray.hit.u = baryU, ray.hit.v = baryV;
+	ray.SetHitPrim(triIdx);
+}
+
+// Same signature and behaviour as BVHBase::TriOccludes
+static bool TriOccludes(const Ray& ray, const bvhvec4slice& verts, const uint32_t triIdx,
+	const uint32_t i0, const uint32_t i1, const uint32_t i2)
+{
+	(void)triIdx; // only needed for opacity maps
+	const bvhvec3 vertex0 = bvhvec3(verts[i0]);
+	const bvhvec3 edge1 = bvhvec3(verts[i1]) - vertex0, edge2 = bvhvec3(verts[i2]) - vertex0;
+	const bvhvec3 directionCrossEdge2 = tinybvh_cross(ray.D, edge2);
+	const float determinant = tinybvh_dot(edge1, directionCrossEdge2);
+	if (determinant == 0.0f) return false;
+	const float inverseDeterminant = 1.0f / determinant;
+	const bvhvec3 originOffset = ray.O - vertex0;
+	const float baryU = inverseDeterminant * tinybvh_dot(originOffset, directionCrossEdge2);
+	const bvhvec3 offsetCrossEdge1 = tinybvh_cross(originOffset, edge1);
+	const float baryV = inverseDeterminant * tinybvh_dot(ray.D, offsetCrossEdge1);
+	if (!(baryU >= 0.0f && baryV >= 0.0f && baryU + baryV <= 1.0f)) return false;
+	const float distance = inverseDeterminant * tinybvh_dot(edge2, offsetCrossEdge1);
+	return distance >= 0.0f && distance <= ray.hit.t;
+}
+
+// For instrumentation for experiment
+struct TraversalStats {
+	uint64_t rayCount = 0;
+	uint64_t nodeVisits = 0;
+	uint64_t boxTests = 0;
+	uint64_t triTests = 0;
+
+	void add(const TraversalStats& other) {
+		rayCount += other.rayCount;
+		nodeVisits += other.nodeVisits;
+		boxTests += other.boxTests;
+		triTests += other.triTests;
+	}
+};
+
+// Copy of DOBB Intersect with instrumentation
+void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* stats = nullptr) {
+	if (stats) stats->rayCount++;
+
+	uint32_t nodeStack[512]; uint32_t stackIdx = 0;
+	nodeStack[stackIdx++] = 0;
+
+	while (stackIdx > 0) {
+		if (stats) stats->nodeVisits++;
+
+		const uint32_t currNodeIdx = nodeStack[--stackIdx];
+		const BVH_DOBB::BVHNode& currNode = bvh.dobbNode[currNodeIdx];
+
+		Ray localRay;
+		localRay.hit.t = ray.hit.t;
+		const uint32_t rotationIdx = currNode.Rotation();
+
+		if (rotationIdx != 255) {
+			const DOBB_LUT::Mat3f rotation = bvh.getLutEntry(rotationIdx);
+			const bvhvec3 rotationX = bvhvec3(rotation.m[0][0], rotation.m[1][0], rotation.m[2][0]);
+			const bvhvec3 rotationY = bvhvec3(rotation.m[0][1], rotation.m[1][1], rotation.m[2][1]);
+			const bvhvec3 rotationZ = bvhvec3(rotation.m[0][2], rotation.m[1][2], rotation.m[2][2]);
+
+			localRay.O = bvhvec3(tinybvh_dot(rotationX, ray.O), tinybvh_dot(rotationY, ray.O), tinybvh_dot(rotationZ, ray.O));
+			localRay.D = bvhvec3(tinybvh_dot(rotationX, ray.D), tinybvh_dot(rotationY, ray.D), tinybvh_dot(rotationZ, ray.D));
+		}
+		else {
+			localRay.O = ray.O; localRay.D = ray.D;
+		}
+		localRay.rD = tinybvh_rcp(localRay.D);
+
+		float stepSize[3] = {ldexpf(1.0f, currNode.exponent[0]), ldexpf(1.0f, currNode.exponent[1]), ldexpf(1.0f, currNode.exponent[2]),};
+
+		uint32_t hitMask = 0; uint32_t remainingSlots = currNode.OccupiedMask();
+
+		while (remainingSlots) {
+			if (stats) stats->boxTests++;
+
+			// Determine which is the next slot to process
+			uint32_t slot = (uint32_t)std::countr_zero(remainingSlots);
+			remainingSlots &= remainingSlots - 1;
+
+			// Determine lower and higher extents of the BB
+			bvhvec3 slotMinPoint = currNode.nodeMinPoint + bvhvec3(currNode.qLo[0][slot] * stepSize[0], currNode.qLo[1][slot] * stepSize[1], currNode.qLo[2][slot] * stepSize[2]);
+			bvhvec3 slotMaxPoint = currNode.nodeMinPoint + bvhvec3(currNode.qHi[0][slot] * stepSize[0], currNode.qHi[1][slot] * stepSize[1], currNode.qHi[2][slot] * stepSize[2]);
+
+			float entryDistance = tinybvh_intersect_aabb(localRay, slotMinPoint, slotMaxPoint);
+			if (entryDistance < BVH_FAR)
+				hitMask |= 1 << slot;
+		}
+
+		uint8_t leafHitMask = hitMask & ~currNode.iMask;
+		uint8_t internalHitMask = hitMask & currNode.iMask;
+
+		// Process leaf hits
+		while (leafHitMask) {
+			const uint32_t slot = (uint32_t)std::countr_zero(leafHitMask);
+			leafHitMask &= leafHitMask - 1;
+
+			// Intersect triangles
+			const uint32_t firstTri = currNode.triBaseIndex + (currNode.meta[slot] & 31);
+			const uint32_t triCount = __popc(currNode.meta[slot] >> 5);
+
+			uint32_t i0, i1, i2;
+			for (uint32_t triIdx = 0; triIdx < triCount; triIdx++) {
+				if (stats) stats->triTests++;
+
+				const uint32_t primIdx = bvh.dobbPrimIdx[firstTri + triIdx];
+				GET_PRIM_INDICES_I0_I1_I2(bvh.bvh8.bvh, primIdx);
+				IntersectTri(ray, primIdx, bvh.bvh8.bvh.verts, i0, i1, i2);
+			}
+		}
+
+		// Process internal hits
+		while (internalHitMask) {
+			const uint32_t slot = (uint32_t)std::countr_zero(internalHitMask);
+			internalHitMask &= internalHitMask - 1;
+
+			// Push internal node
+			nodeStack[stackIdx++] = currNode.ChildBaseIndex() +
+				__popc(currNode.iMask & ((1u << slot) - 1));
+		}
+	}
+}
+
+bool isOccludedInstrumented(const BVH_DOBB& bvh, const Ray& ray, TraversalStats* stats) {
+	if (stats) stats->rayCount++;
+	
+	uint32_t nodeStack[512];
+	uint32_t stackIdx = 0;
+	nodeStack[stackIdx++] = 0;
+
+	while (stackIdx > 0) {
+		if (stats) stats->nodeVisits++;
+
+		const uint32_t currNodeIdx = nodeStack[--stackIdx];
+		const BVH_DOBB::BVHNode& currNode = bvh.dobbNode[currNodeIdx];
+
+		Ray localRay;
+		localRay.hit.t = ray.hit.t;
+		const uint32_t rotationIdx = currNode.Rotation();
+
+		if (rotationIdx != 255) {
+			const DOBB_LUT::Mat3f& rotation = bvh.getLutEntry(rotationIdx);
+
+			const bvhvec3 rotationX = bvhvec3(rotation.m[0][0], rotation.m[1][0], rotation.m[2][0]);
+			const bvhvec3 rotationY = bvhvec3(rotation.m[0][1], rotation.m[1][1], rotation.m[2][1]);
+			const bvhvec3 rotationZ = bvhvec3(rotation.m[0][2], rotation.m[1][2], rotation.m[2][2]);
+
+			localRay.O = bvhvec3(tinybvh_dot(rotationX, ray.O), tinybvh_dot(rotationY, ray.O), tinybvh_dot(rotationZ, ray.O));
+			localRay.D = bvhvec3(tinybvh_dot(rotationX, ray.D), tinybvh_dot(rotationY, ray.D), tinybvh_dot(rotationZ, ray.D));
+		}
+		else {
+			localRay.O = ray.O; localRay.D = ray.D;
+		}
+		localRay.rD = tinybvh_rcp(localRay.D);
+
+		float stepSize[3] = {ldexpf(1.0f, currNode.exponent[0]), ldexpf(1.0f, currNode.exponent[1]), ldexpf(1.0f, currNode.exponent[2])};
+
+		uint32_t hitMask = 0;
+		uint32_t remainingSlots = currNode.OccupiedMask();
+
+		while (remainingSlots) {
+			if (stats) stats->boxTests++;
+
+			// Determine which is the next slot to process
+			uint32_t slot = (uint32_t)std::countr_zero(remainingSlots);
+			remainingSlots &= remainingSlots - 1;
+
+			// Determine lower and higher extents of the BB
+			bvhvec3 slotMinPoint = currNode.nodeMinPoint + bvhvec3(currNode.qLo[0][slot] * stepSize[0], currNode.qLo[1][slot] * stepSize[1], currNode.qLo[2][slot] * stepSize[2]);
+			bvhvec3 slotMaxPoint = currNode.nodeMinPoint + bvhvec3(currNode.qHi[0][slot] * stepSize[0], currNode.qHi[1][slot] * stepSize[1], currNode.qHi[2][slot] * stepSize[2]);
+
+			float entryDistance = tinybvh_intersect_aabb(localRay, slotMinPoint, slotMaxPoint);
+			if (entryDistance < BVH_FAR) 
+				hitMask |= 1 << slot;
+		}
+
+		uint8_t leafHitMask = hitMask & ~currNode.iMask;
+		uint8_t internalHitMask = hitMask & currNode.iMask;
+
+		// Process leaf hits
+		while (leafHitMask) {
+			const uint32_t slot = (uint32_t)std::countr_zero(leafHitMask);
+			leafHitMask &= leafHitMask - 1;
+
+			// Intersect triangles
+			const uint32_t firstTri = currNode.triBaseIndex + (currNode.meta[slot] & 31);
+			const uint32_t triCount = __popc(currNode.meta[slot] >> 5);
+
+			uint32_t i0, i1, i2;
+			for (uint32_t triIdx = 0; triIdx < triCount; triIdx++) {
+				if (stats) stats->triTests++;
+
+				const uint32_t primIdx = bvh.dobbPrimIdx[firstTri + triIdx];
+				GET_PRIM_INDICES_I0_I1_I2(bvh.bvh8.bvh, primIdx);
+				if (TriOccludes(ray, bvh.bvh8.bvh.verts, primIdx, i0, i1, i2))
+					return true;
+			}
+		}
+
+		// Process internal hits
+		while (internalHitMask) {
+			const uint32_t slot = (uint32_t)std::countr_zero(internalHitMask);
+			internalHitMask &= internalHitMask - 1;
+
+			// Push internal node
+			nodeStack[stackIdx++] = currNode.ChildBaseIndex() +
+				__popc(currNode.iMask & ((1u << slot) - 1));
+		}
+	}
+
+	return false;
+}
+
 // ---------------------- RENDERING ----------------------
 // Multi-threading
 static unsigned threadCount = std::thread::hardware_concurrency();
