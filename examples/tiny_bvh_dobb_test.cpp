@@ -27,19 +27,6 @@ enum Phase {
 	END
 };
 
-// Helpers for experimental setup
-static Phase phase = BUILD;
-// TODO: organize into single array of structures
-static const char* meshLocations[2] = {
-	"./testdata/cryteksponza.bin",
-	"./testdata/dragon.bin"
-};
-static const char* meshNames[2] = {
-	"CRYTEKSPONZA", "DRAGON"
-};
-static const int meshCount = sizeof(meshLocations) / sizeof(meshLocations[0]);
-static int meshIdx = 0;
-
 // For instrumentation for experiment
 struct TraversalStats {
 	uint64_t rayCount = 0;
@@ -68,6 +55,48 @@ struct TraversalStats {
 			"Avg triangles intersected per ray: " << triTests / guardedRayCount << std::endl;
 	}
 };
+
+// Setup view pyramid for a pinhole camera:
+// eye, p1 (top-left), p2 (top-right), and p3 (bottom-left)
+struct camera {
+	bvhvec3 eye;
+	bvhvec3 view;
+	bvhvec3 p1, p2, p3;
+
+	void initCamera(bvhvec3 _eye, bvhvec3 _view) {
+		eye = _eye; view = tinybvh_normalize(_view);
+
+		// Update camera vector once
+		bvhvec3 right = tinybvh_normalize(tinybvh_cross(bvhvec3(0, 1, 0), view));
+		bvhvec3 up = 0.8f * tinybvh_cross(view, right);
+		bvhvec3 C = eye + 1.2f * view;
+		p1 = C - right + up;   // top-left
+		p2 = C + right + up;   // top-right
+		p3 = C - right - up;   // bottom-left
+	}
+};
+
+camera cam;
+
+struct SceneSetup {
+	const char* sceneName;
+	const char* meshPath[2];
+	bvhvec3 eye, view;
+};
+
+static const SceneSetup scenes[] = {
+	// {"HAIRBALL",		{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	// {"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
+	// {"WHITE_OAK",		{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.34f, 3.5f, -12.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
+	//// {"DRAGON",			{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	// {"POWERPLANT",		{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	{"CRYTEKSPONZA",	{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
+};
+static const int sceneCount = sizeof(scenes) / sizeof(scenes[0]);
+static int sceneIdx = 0;
+
+// Helpers for experimental setup
+static Phase phase = BUILD;
 
 // Application variables
 static TraversalStats hitStats, shadowStats;
@@ -402,11 +431,6 @@ bool isOccludedInstrumented(const MBVH <8>& bvh8, const Ray& ray, TraversalStats
 // Multi-threading
 static unsigned threadCount = std::thread::hardware_concurrency();
 
-// Setup view pyramid for a pinhole camera:
-// eye, p1 (top-left), p2 (top-right), and p3 (bottom-left)
-static bvhvec3 eye(0, 30, 0), p1, p2, p3;
-static bvhvec3 view = tinybvh_normalize(bvhvec3(-1, 0, 0));
-
 // Xor32 RNG
 static unsigned RandomUInt(unsigned& seed) { seed ^= seed << 13, seed ^= seed >> 17, seed ^= seed << 5; return seed; }
 static float RandomFloat(unsigned& seed) { return RandomUInt(seed) * 2.3283064365387e-10f; }
@@ -493,10 +517,10 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 			const int pixelIdx = pixel_x + pixel_y * SCRWIDTH;
 			// setup primary ray
 			const float u = (float)pixel_x / SCRWIDTH, v = (float)pixel_y / SCRHEIGHT;
-			const bvhvec3 D = tinybvh_normalize(p1 + u * (p2 - p1) + v * (p3 - p1) - eye);
+			const bvhvec3 D = tinybvh_normalize(cam.p1 + u * (cam.p2 - cam.p1) + v * (cam.p3 - cam.p1) - cam.eye);
 			// trace
 			const TraversalStats hitBefore = threadHitStats, shadowBefore = threadShadowStats;
-			Trace(bvh, Ray(eye, D), seed, localCost, threadHitStats, threadShadowStats);
+			Trace(bvh, Ray(cam.eye, D), seed, localCost, threadHitStats, threadShadowStats);
 			// red: total node visits; green: total triangle tests
 			accumulator[pixelIdx] += bvhvec3(
 				nodeVisitScale * ((threadHitStats.nodeVisits - hitBefore.nodeVisits) + (threadShadowStats.nodeVisits - shadowBefore.nodeVisits)),
@@ -581,21 +605,6 @@ void Init() {
 	std::cout.clear();
 	std::cerr.clear();
 #endif
-	// load camera position / direction from file
-	std::fstream t = std::fstream{ "camera.bin", t.binary | t.in };
-	if (t.is_open()) {
-		t.read((char*)&eye, sizeof(eye));
-		t.read((char*)&view, sizeof(view));
-		t.close();
-	}
-
-	// Update camera vector once
-	bvhvec3 right = tinybvh_normalize(tinybvh_cross(bvhvec3(0, 1, 0), view));
-	bvhvec3 up = 0.8f * tinybvh_cross(view, right);
-	bvhvec3 C = eye + 1.2f * view;
-	p1 = C - right + up;   // top-left
-	p2 = C + right + up;   // top-right
-	p3 = C - right - up;   // bottom-left
 }
 
 template <class BVHType>
@@ -617,7 +626,7 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 	snprintf(
 		title, sizeof(title), 
 		"tiny_bvh %s, spp: %d", 
-		meshNames[meshIdx], spp
+		scenes[sceneIdx].sceneName, spp
 	);
 	fenster_update_title(&f, title);
 }
@@ -632,68 +641,64 @@ void resetRender() {
 void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 {
 	switch (phase) {
-		case BUILD:
-			// Reset and load next mesh to be tested
-			std::cout << "Loading mesh: " << meshNames[meshIdx] << std::endl;
-			ClearMesh();
-			AddMesh(
-				meshLocations[meshIdx], 
-				1, bvhvec3(0), 0xffffff,
-				bvhvec3(0.0f, 1.0f, 0.0f), 45.0f 
-			);
-			std::cout << "Building BVHs" << std::endl;
-			// Build BVHs 
-			InitBvhs();
-			
-			// Swap to the next phase
-			phase = RENDERMBVH;
-			resetRender();
-			break;
-		case RENDERMBVH:
-			RenderTick(dobbBvh.bvh8, delta_time_s, f, buf);
-			if (spp >= targetSpp)
-			{
-				std::cout << "MBVH8 BVH, mesh: " << meshNames[meshIdx] << std::endl;
-				hitStats.print("Closest-hit rays");
-				shadowStats.print("Shadow rays");
-				hitStats.add(shadowStats);
-				hitStats.print("All rays");
-				phase = RENDERDOBB;
-				resetRender();
-			}
-			break;
+	case BUILD: {
+		const SceneSetup& scene = scenes[sceneIdx];
 
-		case RENDERDOBB:
-			RenderTick(dobbBvh, delta_time_s, f, buf);
-			if (spp >= targetSpp)
+		// Reset and load next mesh to be tested
+		std::cout << "Loading scene: " << scene.sceneName << std::endl;
+		ClearMesh();
+		if (scene.meshPath[0]) AddMesh(scene.meshPath[0], 1, bvhvec3(0), 0xffffff);
+		if (scene.meshPath[1]) AddMesh(scene.meshPath[1], 1, bvhvec3(0), 0xffffff);
+		cam.initCamera(scene.eye, scene.view);
+		std::cout << "Building BVH for " << triCount << " triangles" << std::endl;
+		// Build BVHs 
+		InitBvhs();
+
+		// Swap to the next phase
+		phase = RENDERMBVH;
+		resetRender();
+		break;
+	}
+	case RENDERMBVH: {
+		RenderTick(dobbBvh.bvh8, delta_time_s, f, buf);
+		if (spp >= targetSpp)
+		{
+			std::cout << "MBVH8 BVH, scene: " << scenes[sceneIdx].sceneName << std::endl;
+			hitStats.print("Primary and secondary rays");
+			shadowStats.print("Shadow rays");
+			hitStats.add(shadowStats);
+			hitStats.print("All rays");
+			phase = RENDERDOBB;
+			resetRender();
+		}
+		break;
+	}
+	case RENDERDOBB: {
+		RenderTick(dobbBvh, delta_time_s, f, buf);
+		if (spp >= targetSpp)
+		{
+			std::cout << "DOBB BVH, mesh: " << scenes[sceneIdx].sceneName << std::endl;
+			hitStats.print("Primary and secondary rays");
+			shadowStats.print("Shadow rays");
+			hitStats.add(shadowStats);
+			hitStats.print("All rays");
+			phase = BUILD;
+			sceneIdx++;
+			if (sceneIdx >= sceneCount)
 			{
-				std::cout << "DOBB BVH, mesh: " << meshNames[meshIdx] << std::endl;
-				hitStats.print("Closest-hit rays");
-				shadowStats.print("Shadow rays");
-				hitStats.add(shadowStats);
-				hitStats.print("All rays");
-				phase = BUILD;
-				meshIdx++;
-				if (meshIdx >= meshCount) 
-				{
-					phase = END;
-					std::cout << "END" << std::endl;
-				}
+				phase = END;
+				std::cout << "END" << std::endl;
 			}
-			break;
-		case END: break;
-		default: break;
+		}
+		break;
+	}
+	case END: { break; }
+	default: { break; }
 	}
 }
 
 // Application Shutdown
-void Shutdown()
-{
-	// save camera position / direction to file
-	std::fstream s = std::fstream{ "camera.bin", s.binary | s.out };
-	s.write((char*)&eye, sizeof(eye));
-	s.write((char*)&view, sizeof(view));
-	s.close();
+void Shutdown() {
 #ifdef _WIN32
 	FreeConsole();
 #endif
