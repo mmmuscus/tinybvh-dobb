@@ -18,10 +18,11 @@ using namespace tinybvh;
 #include <windows.h>
 #endif
 #include <iostream>
+#include <iomanip>
 
 enum Phase {
 	BUILD,
-	RENDERBASE,
+	RENDERMBVH,
 	RENDERDOBB,
 	END
 };
@@ -38,13 +39,41 @@ static const char* meshNames[2] = {
 };
 static const int meshCount = sizeof(meshLocations) / sizeof(meshLocations[0]);
 static int meshIdx = 0;
-static float renderStart;
-static float renderTime = 0.0f;
-static float renderLength = 20.0f;
+
+// For instrumentation for experiment
+struct TraversalStats {
+	uint64_t rayCount = 0;
+	uint64_t nodeVisits = 0;
+	uint64_t boxTests = 0;
+	uint64_t triTests = 0;
+
+	void add(const TraversalStats& other) {
+		rayCount += other.rayCount;
+		nodeVisits += other.nodeVisits;
+		boxTests += other.boxTests;
+		triTests += other.triTests;
+	}
+
+	void reset() {
+		rayCount = 0; nodeVisits = 0; boxTests = 0; triTests = 0;
+	}
+
+	void print(const char* statName) {
+		// Guards against division by 0
+		const double guardedRayCount = rayCount ? (double)rayCount : 1.0f;
+		std::cout << std::fixed << std::setprecision(3) <<
+			statName << rayCount << std::endl <<
+			"Avg nodes visited per ray: " << nodeVisits / guardedRayCount << std::endl <<
+			"Avg boxes intersected per ray: " << (boxTests / guardedRayCount) << std::endl <<
+			"Avg triangles intersected per ray: " << triTests / guardedRayCount << std::endl;
+	}
+};
 
 // Application variables
-static uint64_t cost = 0;
-static BVH baseBvh;
+static TraversalStats hitStats, shadowStats;
+static const int targetSpp = 25;
+static const float nodeVisitScale = 1.0f / 250.0f;
+static const float triTestScale = 1.0f / 1000.0f;
 static BVH_DOBB dobbBvh;
 static bvhvec4* tris = 0;
 static int triCount = 0, spp = 0;
@@ -93,21 +122,6 @@ static bool TriOccludes(const Ray& ray, const bvhvec4slice& verts, const uint32_
 	const float distance = inverseDeterminant * tinybvh_dot(edge2, offsetCrossEdge1);
 	return distance >= 0.0f && distance <= ray.hit.t;
 }
-
-// For instrumentation for experiment
-struct TraversalStats {
-	uint64_t rayCount = 0;
-	uint64_t nodeVisits = 0;
-	uint64_t boxTests = 0;
-	uint64_t triTests = 0;
-
-	void add(const TraversalStats& other) {
-		rayCount += other.rayCount;
-		nodeVisits += other.nodeVisits;
-		boxTests += other.boxTests;
-		triTests += other.triTests;
-	}
-};
 
 // Copy of DOBB Intersect with instrumentation
 void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* stats = nullptr) {
@@ -429,16 +443,14 @@ bvhvec3 TriangleNormal(const unsigned idx)
 
 // Light transport calculation - Basic recursive Path Tracer with IS and Next Event Estimation
 template <class BVHType>
-bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost, unsigned depth = 0)
+bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost, 
+	TraversalStats& threadHitStats, TraversalStats& threadShadowStats, unsigned depth = 0)
 {
 	// find primary intersection
-	int localCost = bvh.Intersect(ray);
-	traceCost += localCost;
-	bvhvec3 localCostVec = bvhvec3((float)localCost / 3000.0f, 0.0f, 0.0f);
+	IntersectionInstrumented(bvh, ray, &threadHitStats);
 	// shade
 	if (ray.hit.t == 1e30f)
-		return localCostVec;
-		// return bvhvec3(0.6f, 0.7f, 1); // hit nothing
+		return bvhvec3(0.6f, 0.7f, 1); // hit nothing
 	bvhvec3 I = ray.O + ray.hit.t * ray.D;
 	bvhvec3 N = TriangleNormal(ray.hit.prim);
 	if (tinybvh_dot(N, ray.D) > 0) N = -N;
@@ -449,24 +461,23 @@ bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost, 
 	bvhvec3 direct = {}, indirect = {};
 	float NdotL = tinybvh_dot(N, L), NLdotL = fabs(tinybvh_dot(L, bvhvec3(0, 1, 0)));
 	if (NdotL > 0)
-		if (!bvh.IsOccluded(Ray(I + L * 0.001f, L, dist)))
+		if (!isOccludedInstrumented(bvh, Ray(I + L * 0.001f, L, dist), &threadShadowStats))
 			direct = BRDF * NdotL * NLdotL * bvhvec3(9, 9, 8) * 500 * (1.0f / (dist * dist));
 	// random bounce
 	if (depth < 2)
 	{
 		bvhvec3 R = CosWeightedDiffReflection(N, seed);
 		float pdf = 1.0f / tinybvh_dot(N, R);
-		bvhvec3 irradiance = Trace(bvh, Ray(I + R * 0.001f, R), seed, traceCost, depth + 1);
-		localCostVec += irradiance;
-		// indirect = BRDF * irradiance * (1.0f / pdf);
+		bvhvec3 irradiance = Trace(bvh, Ray(I + R * 0.001f, R), seed, traceCost, threadHitStats, threadShadowStats, depth + 1);
+		indirect = BRDF * irradiance * (1.0f / pdf);
 	}
 	// finalize
-	// return direct + indirect;
-	return localCostVec;
+	return direct + indirect;
 }
 
 template <class BVHType>
-void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threadIdx)
+void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threadIdx,
+	TraversalStats& threadHitStats, TraversalStats& threadShadowStats)
 {
 	uint64_t localCost = 0;
 	const int xtiles = SCRWIDTH / TILESIZE, ytiles = SCRHEIGHT / TILESIZE;
@@ -484,7 +495,14 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 			const float u = (float)pixel_x / SCRWIDTH, v = (float)pixel_y / SCRHEIGHT;
 			const bvhvec3 D = tinybvh_normalize(p1 + u * (p2 - p1) + v * (p3 - p1) - eye);
 			// trace
-			accumulator[pixelIdx] += Trace(bvh, Ray(eye, D), seed, localCost);
+			const TraversalStats hitBefore = threadHitStats, shadowBefore = threadShadowStats;
+			Trace(bvh, Ray(eye, D), seed, localCost, threadHitStats, threadShadowStats);
+			// red: total node visits; green: total triangle tests
+			accumulator[pixelIdx] += bvhvec3(
+				nodeVisitScale * ((threadHitStats.nodeVisits - hitBefore.nodeVisits) + (threadShadowStats.nodeVisits - shadowBefore.nodeVisits)),
+				triTestScale * ((threadHitStats.triTests - hitBefore.triTests) + (threadShadowStats.triTests - shadowBefore.triTests)),
+				0.0f
+			);
 			const bvhvec3 E = accumulator[pixelIdx] * scale;
 			// visualize, with a poor man's gamma correct
 			const int r = (int)tinybvh_min(255.0f, sqrtf(E.x) * 255.0f);
@@ -494,7 +512,6 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 		}
 		tile = tileIdx++;
 	}
-	cost += localCost;
 }
 
 // ---------------------- LOAD DATA ----------------------
@@ -550,11 +567,7 @@ void ClearMesh()
 // to measure BVH quality
 void InitBvhs() 
 {
-	baseBvh.Build(tris, triCount);
-	baseBvh.c_trav = 1.0, baseBvh.c_int = 0.0;
-	
 	dobbBvh.Build(tris, triCount);
-	dobbBvh.c_trav = 1.0, dobbBvh.c_int = 0.0;
 }
 
 // ---------------------- MISC ----------------------
@@ -588,20 +601,23 @@ void Init() {
 template <class BVHType>
 void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* buf)
 {
-	if (spp > 0) renderTime += delta_time_s;
 	// render tiles
 	const float scale = 1.0f / ++spp;
 	tileIdx = threadCount;
+	std::vector<TraversalStats> threadHitStats(threadCount), threadShadowStats(threadCount);
 	std::vector<std::thread> threads;
 	for (uint32_t i = 0; i < threadCount; i++)
-		threads.emplace_back(TraceWorkerThread<BVHType>, std::cref(bvh), buf, scale, i);
+		threads.emplace_back(TraceWorkerThread<BVHType>, std::cref(bvh), buf, scale, i,
+			std::ref(threadHitStats[i]), std::ref(threadShadowStats[i]));
 	for (auto& thread : threads) thread.join();
+	for (uint32_t i = 0; i < threadCount; i++)
+		hitStats.add(threadHitStats[i]), shadowStats.add(threadShadowStats[i]);
 	// print frame time / rate in window title
 	char title[50];
 	snprintf(
 		title, sizeof(title), 
-		"tiny_bvh %s, spp: %d, time: %f s", 
-		meshNames[meshIdx], spp, renderTime - renderStart
+		"tiny_bvh %s, spp: %d", 
+		meshNames[meshIdx], spp
 	);
 	fenster_update_title(&f, title);
 }
@@ -609,8 +625,8 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 void resetRender() {
 	memset(accumulator, 0, sizeof(accumulator));
 	spp = 0;
-	cost = 0;
-	renderStart = renderTime;
+
+	hitStats.reset(); shadowStats.reset();
 }
 
 void Tick(float delta_time_s, fenster& f, uint32_t* buf)
@@ -630,14 +646,18 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 			InitBvhs();
 			
 			// Swap to the next phase
-			phase = RENDERBASE;
+			phase = RENDERMBVH;
 			resetRender();
 			break;
-		case RENDERBASE:
-			RenderTick(baseBvh, delta_time_s, f, buf);
-			if (renderTime - renderStart >= renderLength)
+		case RENDERMBVH:
+			RenderTick(dobbBvh.bvh8, delta_time_s, f, buf);
+			if (spp >= targetSpp)
 			{
-				std::cout << "Base BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost / spp << std::endl;
+				std::cout << "MBVH8 BVH, mesh: " << meshNames[meshIdx] << std::endl;
+				hitStats.print("Closest-hit rays");
+				shadowStats.print("Shadow rays");
+				hitStats.add(shadowStats);
+				hitStats.print("All rays");
 				phase = RENDERDOBB;
 				resetRender();
 			}
@@ -645,9 +665,13 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 
 		case RENDERDOBB:
 			RenderTick(dobbBvh, delta_time_s, f, buf);
-			if (renderTime - renderStart >= renderLength)
+			if (spp >= targetSpp)
 			{
-				std::cout << "DOBB BVH, mesh: " << meshNames[meshIdx] << ", cost: " << cost / spp << std::endl;
+				std::cout << "DOBB BVH, mesh: " << meshNames[meshIdx] << std::endl;
+				hitStats.print("Closest-hit rays");
+				shadowStats.print("Shadow rays");
+				hitStats.add(shadowStats);
+				hitStats.print("All rays");
 				phase = BUILD;
 				meshIdx++;
 				if (meshIdx >= meshCount) 
