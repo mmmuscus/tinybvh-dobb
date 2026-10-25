@@ -194,6 +194,7 @@ void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* sta
 	}
 }
 
+// Copy of DOBB isOccluded with instrumentation
 bool isOccludedInstrumented(const BVH_DOBB& bvh, const Ray& ray, TraversalStats* stats) {
 	if (stats) stats->rayCount++;
 	
@@ -278,6 +279,105 @@ bool isOccludedInstrumented(const BVH_DOBB& bvh, const Ray& ray, TraversalStats*
 			// Push internal node
 			nodeStack[stackIdx++] = currNode.ChildBaseIndex() +
 				__popc(currNode.iMask & ((1u << slot) - 1));
+		}
+	}
+
+	return false;
+}
+
+// MBVH Intersect matching with DOBB processing order
+void IntersectionInstrumented(const MBVH<8>& bvh8, Ray& ray, TraversalStats* stats) {
+	if (stats) stats->rayCount++;
+
+	uint32_t nodeStack[512];
+	uint32_t stackIdx = 0;
+	nodeStack[stackIdx++] = 0;
+
+	while (stackIdx > 0) {
+		const MBVH<8>::MBVHNode& currNode = bvh8.mbvhNode[nodeStack[--stackIdx]];
+
+		if (currNode.isLeaf()) {
+			uint32_t i0, i1, i2;
+			for (uint32_t triOffset = 0; triOffset < currNode.triCount; triOffset++) {
+				if (stats) stats->triTests++;
+
+				const uint32_t primIdx = bvh8.bvh.primIdx[currNode.firstTri + triOffset];
+				GET_PRIM_INDICES_I0_I1_I2(bvh8.bvh, primIdx);
+				IntersectTri(ray, primIdx, bvh8.bvh.verts, i0, i1, i2);
+			}
+		}
+		else {
+			// Leaves are not nodes in DOBB
+			if (stats) stats->nodeVisits++;
+
+			// Make sure nodes are traversed w the same logic as DOBB
+			bool childHit[8] = {};
+			for (uint32_t slot = 0; slot < 8; slot++) {
+				if (currNode.child[slot] != 0) {
+					if (stats) stats->boxTests++;
+
+					const MBVH<8>::MBVHNode& child = bvh8.mbvhNode[currNode.child[slot]];
+					childHit[slot] = tinybvh_intersect_aabb(ray, child.aabbMin, child.aabbMax) < BVH_FAR;;
+				}
+			}
+
+			for (uint32_t slot = 0; slot < 8; slot++)
+				if (childHit[slot] && !bvh8.mbvhNode[currNode.child[slot]].isLeaf())
+					nodeStack[stackIdx++] = currNode.child[slot];
+
+			for (uint32_t slot = 0; slot < 8; slot++)
+				if (childHit[slot] && bvh8.mbvhNode[currNode.child[slot]].isLeaf())
+					nodeStack[stackIdx++] = currNode.child[slot];
+		}
+	}
+}
+
+// MBVH isOccluded matching with DOBB processing order
+bool isOccludedInstrumented(const MBVH <8>& bvh8, const Ray& ray, TraversalStats* stats) {
+	if (stats) stats->rayCount++;
+
+	Ray boxRay = ray;
+
+	uint32_t nodeStack[512];
+	uint32_t stackIdx = 0;
+	nodeStack[stackIdx++] = 0;
+
+	while (stackIdx > 0) {
+		const MBVH<8>::MBVHNode& currNode = bvh8.mbvhNode[nodeStack[--stackIdx]];
+
+		if (currNode.isLeaf()) {
+			uint32_t i0, i1, i2;
+			for (uint32_t triOffset = 0; triOffset < currNode.triCount; triOffset++) {
+				if (stats) stats->triTests++;
+
+				const uint32_t primIdx = bvh8.bvh.primIdx[currNode.firstTri + triOffset];
+				GET_PRIM_INDICES_I0_I1_I2(bvh8.bvh, primIdx);
+				if (TriOccludes(ray, bvh8.bvh.verts, primIdx, i0, i1, i2))
+					return true;
+			}
+		}
+		else {
+			// Leaves are not nodes in DOBB
+			if (stats) stats->nodeVisits++;
+
+			// Make sure nodes are traversed w the same logic as DOBB
+			bool childHit[8] = {};
+			for (uint32_t slot = 0; slot < 8; slot++) {
+				if (currNode.child[slot] != 0) {
+					if (stats) stats->boxTests++;
+
+					const MBVH<8>::MBVHNode& child = bvh8.mbvhNode[currNode.child[slot]];
+					childHit[slot] = tinybvh_intersect_aabb(boxRay, child.aabbMin, child.aabbMax) < BVH_FAR;;
+				}
+			}
+
+			for (uint32_t slot = 0; slot < 8; slot++)
+				if (childHit[slot] && !bvh8.mbvhNode[currNode.child[slot]].isLeaf())
+					nodeStack[stackIdx++] = currNode.child[slot];
+
+			for (uint32_t slot = 0; slot < 8; slot++)
+				if (childHit[slot] && bvh8.mbvhNode[currNode.child[slot]].isLeaf())
+					nodeStack[stackIdx++] = currNode.child[slot];
 		}
 	}
 
