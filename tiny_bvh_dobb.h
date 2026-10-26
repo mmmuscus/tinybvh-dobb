@@ -293,6 +293,9 @@ namespace tinybvh {
 			uint8_t LeafMask() const { return OccupiedMask() & ~iMask; }
 		};
 
+		// For traversal of the bvh
+		struct StackEntry { uint32_t nodeIdx; float entryDistance; };
+
 		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } // TODO: add layout
 		~BVH_DOBB();
 
@@ -859,15 +862,17 @@ namespace tinybvh {
 	int32_t BVH_DOBB::Intersect(Ray& ray) const {
 		int32_t traversalSteps = 0;
 
-		uint32_t nodeStack[512];
+		StackEntry nodeStack[512];
 		uint32_t stackIdx = 0;
-		nodeStack[stackIdx++] = 0;
+		nodeStack[stackIdx++] = {0, -BVH_FAR};
 
 		while (stackIdx > 0) {
-			traversalSteps += (uint32_t)c_trav;
+			// Early exit if a closer hit was already found
+			const StackEntry entry = nodeStack[--stackIdx];
+			if (entry.entryDistance >= ray.hit.t) continue;
 
-			const uint32_t currNodeIdx = nodeStack[--stackIdx];
-			const BVHNode& currNode = dobbNode[currNodeIdx];
+			traversalSteps += (uint32_t)c_trav;
+			const BVHNode& currNode = dobbNode[entry.nodeIdx];
 
 			Ray localRay;
 			localRay.hit.t = ray.hit.t;
@@ -902,7 +907,10 @@ namespace tinybvh {
 				ldexpf(1.0f, currNode.exponent[2]),
 			};
 
-			uint32_t hitMask = 0;
+			float slotDistance[8];
+			uint32_t sortedSlots[8];
+			uint32_t sortedCount = 0;
+
 			uint32_t remainingSlots = currNode.OccupiedMask();
 
 			while (remainingSlots) {
@@ -925,17 +933,22 @@ namespace tinybvh {
 
 				float entryDistance = tinybvh_intersect_aabb(localRay, slotMinPoint, slotMaxPoint);
 				if (entryDistance < BVH_FAR) {
-					hitMask |= 1 << slot;
+					slotDistance[slot] = entryDistance;
+					// Insertion sort
+					uint32_t insertPos = sortedCount++;
+					while (insertPos > 0 && slotDistance[sortedSlots[insertPos - 1]] > entryDistance) {
+						sortedSlots[insertPos] = sortedSlots[insertPos - 1];
+						insertPos--;
+					}
+					sortedSlots[insertPos] = slot;
 				}
 			}
 
-			uint8_t leafHitMask = hitMask & ~currNode.iMask;
-			uint8_t internalHitMask = hitMask & currNode.iMask;
-
 			// Process leaf hits
-			while (leafHitMask) {
-				const uint32_t slot = (uint32_t)std::countr_zero(leafHitMask);
-				leafHitMask &= leafHitMask - 1;
+			for (uint32_t sortedIdx = 0; sortedIdx < sortedCount; sortedIdx++) {
+				const uint32_t slot = sortedSlots[sortedIdx];
+				if (currNode.iMask & (1u << slot)) continue;
+				if (slotDistance[slot] >= ray.hit.t) break;   // sorted: all remaining are farther
 
 				// Intersect triangles
 				const uint32_t firstTri = currNode.triBaseIndex + (currNode.meta[slot] & 31);
@@ -950,13 +963,16 @@ namespace tinybvh {
 			}
 
 			// Process internal hits
-			while (internalHitMask) {
-				const uint32_t slot = (uint32_t)std::countr_zero(internalHitMask);
-				internalHitMask &= internalHitMask - 1;
+			for (uint32_t sortedIdx = sortedCount; sortedIdx-- > 0;) {
+				const uint32_t slot = sortedSlots[sortedIdx];
+				if (!(currNode.iMask & (1u << slot))) continue;
+				if (slotDistance[slot] >= ray.hit.t) continue;   // behind a leaf hit from this node
 
 				// Push internal node
-				nodeStack[stackIdx++] = currNode.ChildBaseIndex() +
-					__popc(currNode.iMask & ((1u << slot) - 1));
+				nodeStack[stackIdx++] = {
+					currNode.ChildBaseIndex() + __popc(currNode.iMask & ((1u << slot) - 1)),
+					slotDistance[slot]
+				};
 			}
 		}
 

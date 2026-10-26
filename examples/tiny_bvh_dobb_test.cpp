@@ -49,7 +49,7 @@ struct TraversalStats {
 		// Guards against division by 0
 		const double guardedRayCount = rayCount ? (double)rayCount : 1.0f;
 		std::cout << std::fixed << std::setprecision(3) <<
-			statName << rayCount << std::endl <<
+			statName << " " << rayCount << std::endl <<
 			"Avg nodes visited per ray: " << nodeVisits / guardedRayCount << std::endl <<
 			"Avg boxes intersected per ray: " << (boxTests / guardedRayCount) << std::endl <<
 			"Avg triangles intersected per ray: " << triTests / guardedRayCount << std::endl;
@@ -85,11 +85,12 @@ struct SceneSetup {
 };
 
 static const SceneSetup scenes[] = {
-	// {"HAIRBALL",		{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
-	// {"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
-	// {"WHITE_OAK",		{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.34f, 3.5f, -12.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
+	//{"HAIRBALL",		{"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	//{"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
+	//{"WHITE_OAK",		{"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
 	//// {"DRAGON",			{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
-	// {"POWERPLANT",		{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	// TODO: Doublecheck camera for powerplant
+	{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-400.0f, 250.0f, -400.0f), bvhvec3(1.0f, -0.4f, 1.0f)},
 	{"CRYTEKSPONZA",	{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
 };
 static const int sceneCount = sizeof(scenes) / sizeof(scenes[0]);
@@ -100,7 +101,7 @@ static Phase phase = BUILD;
 
 // Application variables
 static TraversalStats hitStats, shadowStats;
-static const int targetSpp = 25;
+static const int targetSpp = 16;
 static const float nodeVisitScale = 1.0f / 250.0f;
 static const float triTestScale = 1.0f / 1000.0f;
 static BVH_DOBB dobbBvh;
@@ -156,14 +157,17 @@ static bool TriOccludes(const Ray& ray, const bvhvec4slice& verts, const uint32_
 void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* stats = nullptr) {
 	if (stats) stats->rayCount++;
 
-	uint32_t nodeStack[512]; uint32_t stackIdx = 0;
-	nodeStack[stackIdx++] = 0;
+	BVH_DOBB::StackEntry nodeStack[512]; uint32_t stackIdx = 0;
+	nodeStack[stackIdx++] = { 0, -BVH_FAR };
 
 	while (stackIdx > 0) {
+		// Early exit if a closer hit was already found
+		const BVH_DOBB::StackEntry entry = nodeStack[--stackIdx];
+		if (entry.entryDistance >= ray.hit.t) continue;
+
 		if (stats) stats->nodeVisits++;
 
-		const uint32_t currNodeIdx = nodeStack[--stackIdx];
-		const BVH_DOBB::BVHNode& currNode = bvh.dobbNode[currNodeIdx];
+		const BVH_DOBB::BVHNode& currNode = bvh.dobbNode[entry.nodeIdx];
 
 		Ray localRay;
 		localRay.hit.t = ray.hit.t;
@@ -185,7 +189,8 @@ void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* sta
 
 		float stepSize[3] = {ldexpf(1.0f, currNode.exponent[0]), ldexpf(1.0f, currNode.exponent[1]), ldexpf(1.0f, currNode.exponent[2]),};
 
-		uint32_t hitMask = 0; uint32_t remainingSlots = currNode.OccupiedMask();
+		float slotDistance[8]; uint32_t sortedSlots[8]; uint32_t sortedCount = 0;
+		uint32_t remainingSlots = currNode.OccupiedMask();
 
 		while (remainingSlots) {
 			if (stats) stats->boxTests++;
@@ -199,17 +204,23 @@ void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* sta
 			bvhvec3 slotMaxPoint = currNode.nodeMinPoint + bvhvec3(currNode.qHi[0][slot] * stepSize[0], currNode.qHi[1][slot] * stepSize[1], currNode.qHi[2][slot] * stepSize[2]);
 
 			float entryDistance = tinybvh_intersect_aabb(localRay, slotMinPoint, slotMaxPoint);
-			if (entryDistance < BVH_FAR)
-				hitMask |= 1 << slot;
+			if (entryDistance < BVH_FAR) {
+				slotDistance[slot] = entryDistance;
+				// Insertion sort
+				uint32_t insertPos = sortedCount++;
+				while (insertPos > 0 && slotDistance[sortedSlots[insertPos - 1]] > entryDistance) {
+					sortedSlots[insertPos] = sortedSlots[insertPos - 1];
+					insertPos--;
+				}
+				sortedSlots[insertPos] = slot;
+			}
 		}
 
-		uint8_t leafHitMask = hitMask & ~currNode.iMask;
-		uint8_t internalHitMask = hitMask & currNode.iMask;
-
 		// Process leaf hits
-		while (leafHitMask) {
-			const uint32_t slot = (uint32_t)std::countr_zero(leafHitMask);
-			leafHitMask &= leafHitMask - 1;
+		for (uint32_t sortedIdx = 0; sortedIdx < sortedCount; sortedIdx++) {
+			const uint32_t slot = sortedSlots[sortedIdx];
+			if (currNode.iMask & (1u << slot)) continue;
+			if (slotDistance[slot] >= ray.hit.t) break;   // sorted: all remaining are farther
 
 			// Intersect triangles
 			const uint32_t firstTri = currNode.triBaseIndex + (currNode.meta[slot] & 31);
@@ -226,13 +237,16 @@ void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* sta
 		}
 
 		// Process internal hits
-		while (internalHitMask) {
-			const uint32_t slot = (uint32_t)std::countr_zero(internalHitMask);
-			internalHitMask &= internalHitMask - 1;
+		for (uint32_t sortedIdx = sortedCount; sortedIdx-- > 0;) {
+			const uint32_t slot = sortedSlots[sortedIdx];
+			if (!(currNode.iMask & (1u << slot))) continue;
+			if (slotDistance[slot] >= ray.hit.t) continue;   // behind a leaf hit from this node
 
 			// Push internal node
-			nodeStack[stackIdx++] = currNode.ChildBaseIndex() +
-				__popc(currNode.iMask & ((1u << slot) - 1));
+			nodeStack[stackIdx++] = {
+					currNode.ChildBaseIndex() + __popc(currNode.iMask & ((1u << slot) - 1)),
+					slotDistance[slot]
+			};
 		}
 	}
 }
@@ -332,12 +346,15 @@ bool isOccludedInstrumented(const BVH_DOBB& bvh, const Ray& ray, TraversalStats*
 void IntersectionInstrumented(const MBVH<8>& bvh8, Ray& ray, TraversalStats* stats) {
 	if (stats) stats->rayCount++;
 
-	uint32_t nodeStack[512];
+	BVH_DOBB::StackEntry nodeStack[512];
 	uint32_t stackIdx = 0;
-	nodeStack[stackIdx++] = 0;
+	nodeStack[stackIdx++] = { 0, -BVH_FAR };
 
 	while (stackIdx > 0) {
-		const MBVH<8>::MBVHNode& currNode = bvh8.mbvhNode[nodeStack[--stackIdx]];
+		const BVH_DOBB::StackEntry entry = nodeStack[--stackIdx];
+		if (entry.entryDistance >= ray.hit.t) continue;
+
+		const MBVH<8>::MBVHNode& currNode = bvh8.mbvhNode[entry.nodeIdx];
 
 		if (currNode.isLeaf()) {
 			uint32_t i0, i1, i2;
@@ -353,24 +370,39 @@ void IntersectionInstrumented(const MBVH<8>& bvh8, Ray& ray, TraversalStats* sta
 			// Leaves are not nodes in DOBB
 			if (stats) stats->nodeVisits++;
 
-			// Make sure nodes are traversed w the same logic as DOBB
-			bool childHit[8] = {};
-			for (uint32_t slot = 0; slot < 8; slot++) {
-				if (currNode.child[slot] != 0) {
-					if (stats) stats->boxTests++;
+			float slotDistance[8]; uint32_t sortedSlots[8]; uint32_t sortedCount = 0;
 
-					const MBVH<8>::MBVHNode& child = bvh8.mbvhNode[currNode.child[slot]];
-					childHit[slot] = tinybvh_intersect_aabb(ray, child.aabbMin, child.aabbMax) < BVH_FAR;;
+			for (uint32_t slot = 0; slot < 8; slot++) {
+				if (currNode.child[slot] == 0) continue;
+				if (stats) stats->boxTests++;
+
+				const MBVH<8>::MBVHNode& child = bvh8.mbvhNode[currNode.child[slot]];
+				const float entryDistance = tinybvh_intersect_aabb(ray, child.aabbMin, child.aabbMax);
+				if (entryDistance < BVH_FAR) {
+					slotDistance[slot] = entryDistance;
+					// Insertion sort
+					uint32_t insertPos = sortedCount++;
+					while (insertPos > 0 && slotDistance[sortedSlots[insertPos - 1]] > entryDistance) {
+						sortedSlots[insertPos] = sortedSlots[insertPos - 1];
+						insertPos--;
+					}
+					sortedSlots[insertPos] = slot;
 				}
 			}
 
-			for (uint32_t slot = 0; slot < 8; slot++)
-				if (childHit[slot] && !bvh8.mbvhNode[currNode.child[slot]].isLeaf())
-					nodeStack[stackIdx++] = currNode.child[slot];
+			// Push internal children first, farthest first
+			for (uint32_t sortedIdx = sortedCount; sortedIdx-- > 0;) {
+				const uint32_t slot = sortedSlots[sortedIdx];
+				if (bvh8.mbvhNode[currNode.child[slot]].isLeaf()) continue;
+				nodeStack[stackIdx++] = { currNode.child[slot], slotDistance[slot] };
+			}
 
-			for (uint32_t slot = 0; slot < 8; slot++)
-				if (childHit[slot] && bvh8.mbvhNode[currNode.child[slot]].isLeaf())
-					nodeStack[stackIdx++] = currNode.child[slot];
+			// Push leaves on top, farthest first, so they pop before the internal children, nearest first
+			for (uint32_t sortedIdx = sortedCount; sortedIdx-- > 0;) {
+				const uint32_t slot = sortedSlots[sortedIdx];
+				if (!bvh8.mbvhNode[currNode.child[slot]].isLeaf()) continue;
+				nodeStack[stackIdx++] = { currNode.child[slot], slotDistance[slot] };
+			}
 		}
 	}
 }
@@ -645,6 +677,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		const SceneSetup& scene = scenes[sceneIdx];
 
 		// Reset and load next mesh to be tested
+		std::cout << " -------------------------------------------- " << std::endl;
 		std::cout << "Loading scene: " << scene.sceneName << std::endl;
 		ClearMesh();
 		if (scene.meshPath[0]) AddMesh(scene.meshPath[0], 1, bvhvec3(0), 0xffffff);
@@ -677,7 +710,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		RenderTick(dobbBvh, delta_time_s, f, buf);
 		if (spp >= targetSpp)
 		{
-			std::cout << "DOBB BVH, mesh: " << scenes[sceneIdx].sceneName << std::endl;
+			std::cout << "DOBB BVH, scene: " << scenes[sceneIdx].sceneName << std::endl;
 			hitStats.print("Primary and secondary rays");
 			shadowStats.print("Shadow rays");
 			hitStats.add(shadowStats);
