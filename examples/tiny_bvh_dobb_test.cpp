@@ -88,9 +88,8 @@ static const SceneSetup scenes[] = {
 	//{"HAIRBALL",		{"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
 	//{"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
 	//{"WHITE_OAK",		{"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
-	//// {"DRAGON",			{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
-	// TODO: Doublecheck camera for powerplant
-	{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-400.0f, 250.0f, -400.0f), bvhvec3(1.0f, -0.4f, 1.0f)},
+	//{"DRAGON",			{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(0.0f, 0.0f, -20.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	//{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
 	{"CRYTEKSPONZA",	{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
 };
 static const int sceneCount = sizeof(scenes) / sizeof(scenes[0]);

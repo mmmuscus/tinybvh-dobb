@@ -52,6 +52,9 @@ namespace tinybvh {
 
 	class DOBB_LUT {
 	public: 
+		static constexpr float PI = 3.14159265358979f;
+		static constexpr uint32_t AZIMUTH_BINS = 32, POLAR_BINS = 16, ANGLE_BINS = 16;
+
 		struct Mat3f { float m[3][3]; };
 		struct Mat3i { uint8_t m[3][3]; };
 
@@ -63,10 +66,12 @@ namespace tinybvh {
 		float rotationValues[MAXROTATIONVALUES];
 		Mat3i rotations[AXESNO * SMALLM * 2];
 		reprojectionEntry reprojections[AXESNO * SMALLM * 2][6];
+		uint8_t azimuthAngles[AZIMUTH_BINS * POLAR_BINS * ANGLE_BINS];
 
 		DOBB_LUT() { 
 			buildLUT(); 
 			buildReprojectionLUT();
+			buildAxisAzimuthLUT();
 		}
 
 		Mat3f getRawEntry(uint32_t rotIdx) {
@@ -88,34 +93,13 @@ namespace tinybvh {
 			return ret;
 		}
 
-		const float similarity(const bvhvec3 (&capitalB)[3], const uint32_t rotIdx) {
-			const Mat3f rotMat = getRawEntry(rotIdx);
-			// Using dot product, set up matrix that we can use to compare
-			// all possible permutations of bases
-			Mat3f dotMat;
-
-			for (uint32_t i = 0; i < 3; i++) {
-				const bvhvec3 r(rotMat.m[0][i], rotMat.m[1][i], rotMat.m[2][i]);
-				
-				for (uint32_t j = 0; j < 3; j++)
-					dotMat.m[i][j] = fabsf(tinybvh_dot(r, capitalB[j]));
-			}
-
-			static const int Perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
-			float maxSim = 0.0f;
-			for (uint32_t i = 0; i < 6; i++)
-				maxSim = tinybvh_max(
-					maxSim,
-					dotMat.m[0][Perms[i][0]] +
-					dotMat.m[1][Perms[i][1]] +
-					dotMat.m[2][Perms[i][2]]
-				);
-
-			return maxSim;
+		uint8_t getRotationForBasis(const bvhvec3(&basis)[3]) {
+			bvhvec3 axis; float angle;
+			basisToAxisAngle(basis, axis, angle);
+			return azimuthAngles[axisAngleToCell(axis, angle)];
 		}
 
 	private:
-
 		// https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
 		// axis must be normalized
 		static Mat3f rodriguesRotMat(bvhvec3 axis, float angle) {
@@ -198,6 +182,124 @@ namespace tinybvh {
 						-candidateAxis,
 						reprojections[rotationIdx][candidateRotAxisIdx * 2 + 1]
 					);
+				}
+			}
+		}
+
+		static void basisToAxisAngle(const bvhvec3(&basis)[3], bvhvec3& axis, float& angle) {
+			// Find theta angle by "reverse-rodriguez"
+			const float trace = basis[0].x + basis[1].y + basis[2].z;
+			angle = acosf(tinybvh_clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f));
+			const float sinAngle = sinf(angle);
+
+			if (sinAngle > 1e-4f) {
+				// General case: find axis by "reverse-rodriguez"
+				axis = tinybvh_normalize(bvhvec3(
+					basis[1].z - basis[2].y,
+					basis[2].x - basis[0].z,
+					basis[0].y - basis[1].x
+				));
+			}
+			else if (angle < 1.0f) {
+				// Angle is roughly 0, axis is arbitrary
+				axis = bvhvec3(0.0f, 0.0f, 1.0f);
+			}
+			else {
+				// Angle is roughly PI non-general "reverse-rodriguez"
+				const float diagonal[3] = { basis[0].x, basis[1].y, basis[2].z };
+				uint32_t largestIdx = 0;
+				if (diagonal[1] > diagonal[largestIdx]) largestIdx = 1;
+				if (diagonal[2] > diagonal[largestIdx]) largestIdx = 2;
+
+				float components[3];
+				components[largestIdx] = sqrtf(tinybvh_max((diagonal[largestIdx] + 1.0f) * 0.5f, 0.0f));
+				for (uint32_t componentIdx = 0; componentIdx < 3; componentIdx++) {
+					if (componentIdx == largestIdx) continue;
+					// m[largest][k] + m[k][largest]
+					const float symmetricSum = basis[componentIdx][largestIdx] + basis[largestIdx][componentIdx];
+					components[componentIdx] = symmetricSum / (4.0f * components[largestIdx]);
+				}
+				axis = tinybvh_normalize(bvhvec3(components[0], components[1], components[2]));
+			}
+		}
+
+		static uint32_t toBin(const float fraction, const uint32_t binCount) {
+			return (uint32_t)tinybvh_clamp(fraction * binCount, 0.0f, (float)(binCount - 1));
+		}
+
+		// Slot an axis, angle combination into our qunatized bins
+		static uint32_t axisAngleToCell(const bvhvec3& axis, const float angle) {
+			const float azimuth = atan2f(axis.y, axis.x);
+			const float polar = acosf(tinybvh_clamp(axis.z, -1.0f, 1.0f));
+
+			const uint32_t azimuthBin = toBin((azimuth + PI) / (2.0f * PI), AZIMUTH_BINS);
+			const uint32_t polarBin = toBin(polar / PI, POLAR_BINS);
+			const uint32_t angleBin = toBin(angle / PI, ANGLE_BINS);
+
+			return (angleBin * POLAR_BINS + polarBin) * AZIMUTH_BINS + azimuthBin;
+		}
+
+		const float similarity(const bvhvec3(&capitalB)[3], const uint32_t rotIdx) {
+			const Mat3f rotMat = getRawEntry(rotIdx);
+			// Using dot product, set up matrix that we can use to compare
+			// all possible permutations of bases
+			Mat3f dotMat;
+
+			for (uint32_t i = 0; i < 3; i++) {
+				const bvhvec3 r(rotMat.m[0][i], rotMat.m[1][i], rotMat.m[2][i]);
+
+				for (uint32_t j = 0; j < 3; j++)
+					dotMat.m[i][j] = fabsf(tinybvh_dot(r, capitalB[j]));
+			}
+
+			static const int Perms[6][3] = { {0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0} };
+			float maxSim = 0.0f;
+			for (uint32_t i = 0; i < 6; i++)
+				maxSim = tinybvh_max(
+					maxSim,
+					dotMat.m[0][Perms[i][0]] +
+					dotMat.m[1][Perms[i][1]] +
+					dotMat.m[2][Perms[i][2]]
+				);
+
+			return maxSim;
+		}
+
+		uint8_t bruteForceBestRot(const bvhvec3(&basis)[3]) {
+			float bestSim = -1.0f;
+			uint8_t bestRot = 0;
+
+			for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
+				float sim = similarity(basis, rotationIdx);
+				if (sim > bestSim) {
+					bestSim = sim;
+					bestRot = rotationIdx;
+				}
+			}
+
+			return bestRot;
+		}
+
+		void buildAxisAzimuthLUT() {
+			for (uint32_t angleBin = 0; angleBin < ANGLE_BINS; angleBin++) {
+				for (uint32_t polarBin = 0; polarBin < POLAR_BINS; polarBin++) {
+					for (uint32_t azimuthBin = 0; azimuthBin < AZIMUTH_BINS; azimuthBin++) {
+						// Identify cell
+						const float angle = (angleBin + 0.5f) / ANGLE_BINS * PI;
+						const float polar = (polarBin + 0.5f) / POLAR_BINS * PI;
+						const float azimuth = (azimuthBin + 0.5f) / AZIMUTH_BINS * 2.0f * PI - PI;
+
+						const bvhvec3 axis(sinf(polar) * cosf(azimuth), sinf(polar) * sinf(azimuth), cosf(polar));
+						const Mat3f cellRotation = rodriguesRotMat(axis, angle);
+						const bvhvec3 basis[3] = {
+							bvhvec3(cellRotation.m[0][0], cellRotation.m[1][0], cellRotation.m[2][0]),
+							bvhvec3(cellRotation.m[0][1], cellRotation.m[1][1], cellRotation.m[2][1]),
+							bvhvec3(cellRotation.m[0][2], cellRotation.m[1][2], cellRotation.m[2][2])
+						};
+
+						const uint32_t cellIdx = (angleBin * POLAR_BINS + polarBin) * AZIMUTH_BINS + azimuthBin;
+						azimuthAngles[cellIdx] = bruteForceBestRot(basis);
+					}
 				}
 			}
 		}
@@ -296,7 +398,8 @@ namespace tinybvh {
 		// For traversal of the bvh
 		struct StackEntry { uint32_t nodeIdx; float entryDistance; };
 
-		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } // TODO: add layout
+		// TODO: add layout
+		BVH_DOBB(BVHContext ctx = {}) { context = ctx; } 
 		~BVH_DOBB();
 
 		void Build(const bvhvec4* vertices, const uint32_t primCount);
@@ -520,17 +623,8 @@ namespace tinybvh {
 					}
 				}
 
-				// TODO: Implement axis azimuth version instead of brute force
 				// find best rotation candidate for leaf node with B
-				float bestSim = -1.0f;
-				sideband[nodeIdx].rotation = 0;
-				for (uint8_t rotationIdx = 0; rotationIdx < AXESNO * SMALLM * 2; rotationIdx++) {
-					float sim = lut.similarity({a0, a1, a2}, rotationIdx);
-					if (sim > bestSim) {
-						bestSim = sim;
-						sideband[nodeIdx].rotation = rotationIdx;
-					}
-				}
+				sideband[nodeIdx].rotation = lut.getRotationForBasis({ a0, a1, a2 });
 
 				// Create proxy KDop to propagate up
 				for (uint32_t vertIdx = 0; vertIdx < noLeafVerts; vertIdx++) {
