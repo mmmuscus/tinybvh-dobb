@@ -8,6 +8,7 @@
 #define AXESNO 13
 #define SMALLM 4
 #define MAXROTATIONVALUES 44
+#define ALPHA 0.9f
 
 #ifndef FATAL_ERROR_IF
 #define FATAL_ERROR_IF(condition, message) if (condition) { fprintf( stderr, "Fatal error in tiny_bvh_dobb.h, line %i:\n%s\n", __LINE__, message ); exit( 1 ); }
@@ -1027,7 +1028,7 @@ namespace tinybvh {
 			// Determine chosen rotation, record extents if no rotation
 			uint8_t chosenRotation;
 
-			if (DOBBSASum < sideband[currBvhIdx].AABBSASum) {
+			if (DOBBSASum < ALPHA * sideband[currBvhIdx].AABBSASum) {
 				chosenRotation = candidateRotationIdx;
 			}
 			else {
