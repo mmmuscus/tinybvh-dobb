@@ -427,6 +427,8 @@ namespace tinybvh {
 		static DOBB_LUT lut;
 
 		void calcBasisVectorsForBFromTri(const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2);
+
+		void quadify();
 };
 
 } // namespace tinybvh
@@ -462,14 +464,92 @@ namespace tinybvh {
 		// make sure we own bvh8 (a previous ConvertFrom may have left it referencing someone else's)
 		if (!ownBVH8) bvh8.DropReference(context), ownBVH8 = true;
 		bvh8.bvh.context = context;
+		// TODO: Decide whether or not to recreate H-PLOC
 		// Build binary BVH
+		bvh8.bvh.settings.useFullSweep = true;
 		bvh8.bvh.Build(vertices, indices, primCount);
-		// DOBB leaves can hold only up to 2 triangles
-		bvh8.bvh.SplitLeafs(2);
+		// TODO: Decide to use Optimize() or not
+		// Quadify the BVH for next steps
+		quadify();
 		// Create 8 wide BVH
 		bvh8.ConvertFrom(bvh8.bvh, true);
 		// Create oriented tree
 		ConvertFrom(bvh8);
+	}
+
+	void BVH_DOBB::quadify() {
+		BVH& bvh = bvh8.bvh;
+
+		uint32_t stack[512]; 
+		uint32_t stackIdx = 0;
+		stack[stackIdx++] = 0;
+
+		while (stackIdx > 0) {
+			BVH::BVHNode& currNode = bvh.bvhNode[stack[--stackIdx]];
+
+			if (currNode.triCount <= 2) {
+				// Internal node OR leaf node with at most 2 triangles, nothing to "quadify"
+				if (!currNode.isLeaf()) {
+					// In case it is an internal node, add the two children to the stack
+					stack[stackIdx++] = currNode.leftFirst;
+					stack[stackIdx++] = currNode.leftFirst + 1;
+				}
+			}
+			else {
+				// In case it is leaf node with triCount > 2 we need to quadify
+				const uint32_t firstTri = currNode.leftFirst;
+
+				// Extract the triangle
+				uint32_t i0, i1, i2;
+				GET_PRIM_INDICES_I0_I1_I2(bvh, bvh.primIdx[firstTri]);
+				bvhvec3 vert0 = bvh.verts[i0], vert1 = bvh.verts[i1], vert2 = bvh.verts[i2];
+				const bvhvec3 firstTriMin = tinybvh_min(vert0, tinybvh_min(vert1, vert2));
+				const bvhvec3 firstTriMax = tinybvh_max(vert0, tinybvh_max(vert1, vert2));
+
+				// Find the best pairing
+				float minSA = BVH_FAR;
+				uint32_t minPairIdx = firstTri + 1;
+				for (uint32_t candidateIdx = firstTri + 1; candidateIdx < firstTri + currNode.triCount; candidateIdx++) {
+					GET_PRIM_INDICES_I0_I1_I2(bvh, bvh.primIdx[candidateIdx]);
+					bvhvec3 vert0 = bvh.verts[i0], vert1 = bvh.verts[i1], vert2 = bvh.verts[i2];
+
+					bvhvec3 extent = 
+						tinybvh_max(firstTriMax, tinybvh_max(vert0, tinybvh_max(vert1, vert2)))
+						- tinybvh_min(firstTriMin, tinybvh_min(vert0, tinybvh_min(vert1, vert2)));
+
+					const float candidateSA = extent.x * extent.y + extent.y * extent.z + extent.z * extent.x;
+					if (candidateSA < minSA) {
+						minSA = candidateSA;
+						minPairIdx = candidateIdx;
+					}
+				}
+
+				// Swap triangles
+				const uint32_t swappedPrim = bvh.primIdx[firstTri + 1];
+				bvh.primIdx[firstTri + 1] = bvh.primIdx[minPairIdx];
+				bvh.primIdx[minPairIdx] = swappedPrim;
+
+				// Split leaves
+				// Create and init new nodes
+				const uint32_t leftIdx = bvh.newNodePtr;
+				BVH::BVHNode& left = bvh.bvhNode[leftIdx];		left = currNode;
+				BVH::BVHNode& right = bvh.bvhNode[leftIdx + 1]; right = currNode;
+				// Correct wrong values in new nodes
+				left.triCount = 2; right.triCount = currNode.triCount - 2;
+				right.leftFirst = currNode.leftFirst + 2;
+				// Update currNode
+				currNode.leftFirst = leftIdx;
+				currNode.triCount = 0;
+
+				bvh.newNodePtr += 2;
+
+				// Push new (right) node onto the stack
+				stack[stackIdx++] = leftIdx + 1;
+			}
+		}
+
+		bvh.usedNodes = bvh.newNodePtr;
+		bvh.Refit();
 	}
 
 	void BVH_DOBB::ConvertFrom(const MBVH<8>& original)
