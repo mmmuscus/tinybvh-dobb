@@ -99,7 +99,7 @@ static int sceneIdx = 0;
 static Phase phase = BUILD;
 
 // Application variables
-static TraversalStats hitStats, shadowStats;
+static TraversalStats primHitStats, secondHitStats, shadowStats;
 static const int targetSpp = 16;
 static const float nodeVisitScale = 1.0f / 250.0f;
 static const float triTestScale = 1.0f / 1000.0f;
@@ -499,10 +499,11 @@ bvhvec3 TriangleNormal(const unsigned idx)
 // Light transport calculation - Basic recursive Path Tracer with IS and Next Event Estimation
 template <class BVHType>
 bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost, 
-	TraversalStats& threadHitStats, TraversalStats& threadShadowStats, unsigned depth = 0)
+	TraversalStats& threadPrimHitStats, TraversalStats& threadSecondHitStats, TraversalStats& threadShadowStats, unsigned depth = 0)
 {
 	// find primary intersection
-	IntersectionInstrumented(bvh, ray, &threadHitStats);
+	if (depth == 0) IntersectionInstrumented(bvh, ray, &threadPrimHitStats);
+	else			IntersectionInstrumented(bvh, ray, &threadSecondHitStats);
 	// shade
 	if (ray.hit.t == 1e30f)
 		return bvhvec3(0.6f, 0.7f, 1); // hit nothing
@@ -523,7 +524,8 @@ bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost,
 	{
 		bvhvec3 R = CosWeightedDiffReflection(N, seed);
 		float pdf = 1.0f / tinybvh_dot(N, R);
-		bvhvec3 irradiance = Trace(bvh, Ray(I + R * 0.001f, R), seed, traceCost, threadHitStats, threadShadowStats, depth + 1);
+		bvhvec3 irradiance;
+		irradiance = Trace(bvh, Ray(I + R * 0.001f, R), seed, traceCost, threadPrimHitStats, threadSecondHitStats, threadShadowStats, depth + 1);
 		indirect = BRDF * irradiance * (1.0f / pdf);
 	}
 	// finalize
@@ -532,7 +534,7 @@ bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost,
 
 template <class BVHType>
 void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threadIdx,
-	TraversalStats& threadHitStats, TraversalStats& threadShadowStats)
+	TraversalStats& threadPrimHitStats, TraversalStats& threadSecondHitStats, TraversalStats& threadShadowStats)
 {
 	uint64_t localCost = 0;
 	const int xtiles = SCRWIDTH / TILESIZE, ytiles = SCRHEIGHT / TILESIZE;
@@ -550,12 +552,18 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 			const float u = (float)pixel_x / SCRWIDTH, v = (float)pixel_y / SCRHEIGHT;
 			const bvhvec3 D = tinybvh_normalize(cam.p1 + u * (cam.p2 - cam.p1) + v * (cam.p3 - cam.p1) - cam.eye);
 			// trace
-			const TraversalStats hitBefore = threadHitStats, shadowBefore = threadShadowStats;
-			Trace(bvh, Ray(cam.eye, D), seed, localCost, threadHitStats, threadShadowStats);
+			const TraversalStats primHitBefore = threadPrimHitStats, secondHitBefore = threadSecondHitStats, shadowBefore = threadShadowStats;
+			Trace(bvh, Ray(cam.eye, D), seed, localCost, threadPrimHitStats, threadSecondHitStats, threadShadowStats);
 			// red: total node visits; green: total triangle tests
 			accumulator[pixelIdx] += bvhvec3(
-				nodeVisitScale * ((threadHitStats.nodeVisits - hitBefore.nodeVisits) + (threadShadowStats.nodeVisits - shadowBefore.nodeVisits)),
-				triTestScale * ((threadHitStats.triTests - hitBefore.triTests) + (threadShadowStats.triTests - shadowBefore.triTests)),
+				nodeVisitScale * 
+					((threadPrimHitStats.nodeVisits - primHitBefore.nodeVisits) + 
+					(threadSecondHitStats.nodeVisits - secondHitBefore.nodeVisits) + 
+					(threadShadowStats.nodeVisits - shadowBefore.nodeVisits)),
+				triTestScale * 
+					((threadPrimHitStats.triTests - primHitBefore.triTests) + 
+					(threadSecondHitStats.triTests - secondHitBefore.triTests) +
+					(threadShadowStats.triTests - shadowBefore.triTests)),
 				0.0f
 			);
 			const bvhvec3 E = accumulator[pixelIdx] * scale;
@@ -644,14 +652,14 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 	// render tiles
 	const float scale = 1.0f / ++spp;
 	tileIdx = threadCount;
-	std::vector<TraversalStats> threadHitStats(threadCount), threadShadowStats(threadCount);
+	std::vector<TraversalStats> threadPrimHitStats(threadCount), threadSecondHitStats(threadCount), threadShadowStats(threadCount);
 	std::vector<std::thread> threads;
 	for (uint32_t i = 0; i < threadCount; i++)
 		threads.emplace_back(TraceWorkerThread<BVHType>, std::cref(bvh), buf, scale, i,
-			std::ref(threadHitStats[i]), std::ref(threadShadowStats[i]));
+			std::ref(threadPrimHitStats[i]), std::ref(threadSecondHitStats[i]), std::ref(threadShadowStats[i]));
 	for (auto& thread : threads) thread.join();
 	for (uint32_t i = 0; i < threadCount; i++)
-		hitStats.add(threadHitStats[i]), shadowStats.add(threadShadowStats[i]);
+		primHitStats.add(threadPrimHitStats[i]), secondHitStats.add(threadSecondHitStats[i]), shadowStats.add(threadShadowStats[i]);
 	// print frame time / rate in window title
 	char title[50];
 	snprintf(
@@ -666,7 +674,7 @@ void resetRender() {
 	memset(accumulator, 0, sizeof(accumulator));
 	spp = 0;
 
-	hitStats.reset(); shadowStats.reset();
+	primHitStats.reset(); secondHitStats.reset(); shadowStats.reset();
 }
 
 void Tick(float delta_time_s, fenster& f, uint32_t* buf)
@@ -696,10 +704,12 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		if (spp >= targetSpp)
 		{
 			std::cout << "MBVH8 BVH, scene: " << scenes[sceneIdx].sceneName << std::endl;
-			hitStats.print("Primary and secondary rays");
+			primHitStats.print("Primary rays");
+			secondHitStats.print("Secondary rays");
 			shadowStats.print("Shadow rays");
-			hitStats.add(shadowStats);
-			hitStats.print("All rays");
+			primHitStats.add(shadowStats);
+			primHitStats.add(secondHitStats);
+			primHitStats.print("All rays");
 			phase = RENDERDOBB;
 			resetRender();
 		}
@@ -710,10 +720,12 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		if (spp >= targetSpp)
 		{
 			std::cout << "DOBB BVH, scene: " << scenes[sceneIdx].sceneName << std::endl;
-			hitStats.print("Primary and secondary rays");
+			primHitStats.print("Primary rays");
+			secondHitStats.print("Secondary rays");
 			shadowStats.print("Shadow rays");
-			hitStats.add(shadowStats);
-			hitStats.print("All rays");
+			primHitStats.add(shadowStats);
+			primHitStats.add(secondHitStats);
+			primHitStats.print("All rays");
 			phase = BUILD;
 			sceneIdx++;
 			if (sceneIdx >= sceneCount)
