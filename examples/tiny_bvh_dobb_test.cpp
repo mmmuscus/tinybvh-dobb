@@ -86,17 +86,18 @@ static int viewPointIdx = 0;
 
 struct SceneSetup {
 	const char* sceneName;
+	float viewPointScale = 1.0f;
 	const char* meshPath[2];
 	bvhvec3 eye, view;
 };
 
 static const SceneSetup scenes[] = {
-	{"HAIRBALL",		{"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
-	{"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
-	{"WHITE_OAK",		{"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
-	{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
-	{"DRAGON",			{"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
-	{"CRYTEKSPONZA",	{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
+	{"HAIRBALL",		1.0f,  {"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	{"BISTRO_EXTERIOR", 0.2f,  {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
+	{"WHITE_OAK",		1.0f,  {"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
+	{"POWERPLANT",		0.15f, {"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
+	{"DRAGON",			1.0f,  {"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
+	{"CRYTEKSPONZA",	0.15f, {"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
 };
 static const int sceneCount = sizeof(scenes) / sizeof(scenes[0]);
 static int sceneIdx = 0;
@@ -109,6 +110,7 @@ static TraversalStats primHitStats, secondHitStats, shadowStats;
 static const int targetSpp = 8;
 static const float nodeVisitScale = 1.0f / 250.0f;
 static const float triTestScale = 1.0f / 1000.0f;
+static const float boxTestScale = 1.0f / 2000.0f;
 static BVH_DOBB dobbBvh;
 static bvhvec4* tris = 0;
 static int triCount = 0, spp = 0;
@@ -601,7 +603,7 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 			// trace
 			const TraversalStats primHitBefore = threadPrimHitStats, secondHitBefore = threadSecondHitStats, shadowBefore = threadShadowStats;
 			Trace(bvh, Ray(cam.eye, D), seed, localCost, threadPrimHitStats, threadSecondHitStats, threadShadowStats);
-			// red: total node visits; green: total triangle tests
+			// red: total node visits; green: total triangle tests; blue: total box tests
 			accumulator[pixelIdx] += bvhvec3(
 				nodeVisitScale * 
 					((threadPrimHitStats.nodeVisits - primHitBefore.nodeVisits) + 
@@ -611,7 +613,10 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 					((threadPrimHitStats.triTests - primHitBefore.triTests) + 
 					(threadSecondHitStats.triTests - secondHitBefore.triTests) +
 					(threadShadowStats.triTests - shadowBefore.triTests)),
-				0.0f
+				boxTestScale *
+					((threadPrimHitStats.boxTests - primHitBefore.boxTests) +
+					(threadSecondHitStats.boxTests - secondHitBefore.boxTests) +
+					(threadShadowStats.boxTests - shadowBefore.boxTests))
 			);
 			const bvhvec3 E = accumulator[pixelIdx] * scale;
 			// visualize, with a poor man's gamma correct
@@ -672,16 +677,29 @@ void ClearMesh()
 }
 
 // Places cameras on a sphere centered in the middle of a mesh
-void GenerateViewPoints() {
-	// Find Bounding box of all vertices (DOBB only fits loosely)
+void GenerateViewPoints(float viewPointRadiusScale = 1.0f) {
+	// Find Bounding box of all vertices (DOBB only fits loosely) for the radius
 	bvhvec3 minBounds(BVH_FAR, BVH_FAR, BVH_FAR), maxBounds(-BVH_FAR, -BVH_FAR, -BVH_FAR);
-	for (int vertIdx = 0; vertIdx < triCount * 3; vertIdx++) {
-		minBounds = tinybvh_min(minBounds, bvhvec3(tris[vertIdx]));
-		maxBounds = tinybvh_max(maxBounds, bvhvec3(tris[vertIdx]));
+	// Get average of vertices for center of "viewpoint sphere"
+	double vertexSumX = 0.0f, vertexSumY = 0.0f, vertexSumZ = 0.0f;
+	const int vertCount = triCount * 3;
+	for (int vertIdx = 0; vertIdx < vertCount; vertIdx++) {
+		const bvhvec3 vert = bvhvec3(tris[vertIdx]);
+
+		minBounds = tinybvh_min(minBounds, vert);
+		maxBounds = tinybvh_max(maxBounds, vert);
+
+		vertexSumX += vert.x;
+		vertexSumY += vert.y;
+		vertexSumZ += vert.z;
 	}
 
-	const bvhvec3 center = (minBounds + maxBounds) * 0.5f;
-	const float camDist = tinybvh_length(maxBounds - minBounds) * 0.5f * 1.8f * 0.5f;
+	const float camDist = tinybvh_length(maxBounds - minBounds) * 0.5f * viewPointRadiusScale;
+	const bvhvec3 center(
+		(float)(vertexSumX / vertCount),
+		(float)(vertexSumY / vertCount),
+		(float)(vertexSumZ / vertCount)
+	);
 
 	// Evenly spaced cameras (fibonacci sphere) via Claude
 	for (uint32_t pointIdx = 0; pointIdx < NUMBEROFVIEWPOINTS; pointIdx++) {
@@ -730,12 +748,16 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 	for (auto& thread : threads) thread.join();
 	for (uint32_t i = 0; i < threadCount; i++)
 		primHitStats.add(threadPrimHitStats[i]), secondHitStats.add(threadSecondHitStats[i]), shadowStats.add(threadShadowStats[i]);
-	// print frame time / rate in window title
+	// Create title
+	const char* bvhName = "-";
+	if (phase == RENDERDOBB) bvhName = "DOBB BVH";
+	if (phase == RENDERMBVH) bvhName = "MBVH 8";
 	char title[80];
 	snprintf(
 		title, sizeof(title), 
-		"%s, view %d/%d spp: %d", 
-		scenes[sceneIdx].sceneName, viewPointIdx + 1, NUMBEROFVIEWPOINTS, spp
+		"%s, %s, view %d/%d spp: %d", 
+		bvhName, scenes[sceneIdx].sceneName, 
+		viewPointIdx + 1, NUMBEROFVIEWPOINTS, spp
 	);
 	fenster_update_title(&f, title);
 }
@@ -763,7 +785,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		ClearMesh();
 		if (scene.meshPath[0]) AddMesh(scene.meshPath[0], 1, bvhvec3(0), 0xffffff);
 		if (scene.meshPath[1]) AddMesh(scene.meshPath[1], 1, bvhvec3(0), 0xffffff);
-		GenerateViewPoints();
+		GenerateViewPoints(scene.viewPointScale);
 
 		// Build BVHs 
 		std::cout << "Building BVHs for " << triCount << " triangles" << std::endl;
