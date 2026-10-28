@@ -21,6 +21,8 @@ using namespace tinybvh;
 #include <iomanip>
 #include <string>
 
+#define NUMBEROFVIEWPOINTS 25
+
 enum Phase {
 	BUILD,
 	RENDERMBVH,
@@ -79,6 +81,9 @@ struct camera {
 
 camera cam;
 
+static camera viewPointCameras[NUMBEROFVIEWPOINTS];
+static int viewPointIdx = 0;
+
 struct SceneSetup {
 	const char* sceneName;
 	const char* meshPath[2];
@@ -86,11 +91,11 @@ struct SceneSetup {
 };
 
 static const SceneSetup scenes[] = {
-	//{"HAIRBALL",		{"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
-	//{"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
-	//{"WHITE_OAK",		{"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
-	//{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
-	//{"DRAGON",			{"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
+	{"HAIRBALL",		{"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	{"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
+	{"WHITE_OAK",		{"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
+	{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
+	{"DRAGON",			{"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
 	{"CRYTEKSPONZA",	{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
 };
 static const int sceneCount = sizeof(scenes) / sizeof(scenes[0]);
@@ -101,7 +106,7 @@ static Phase phase = BUILD;
 
 // Application variables
 static TraversalStats primHitStats, secondHitStats, shadowStats;
-static const int targetSpp = 16;
+static const int targetSpp = 8;
 static const float nodeVisitScale = 1.0f / 250.0f;
 static const float triTestScale = 1.0f / 1000.0f;
 static BVH_DOBB dobbBvh;
@@ -474,7 +479,7 @@ void printStats(const char* tableName) {
 	const int firstColWidth = 35, colWidth = 15;
 
 	std::cout << std::left << std::setw(firstColWidth) << tableName << std::right
-		<< " | " << std::setw(colWidth) << "Pirmary Rays"
+		<< " | " << std::setw(colWidth) << "Primary Rays"
 		<< " | " << std::setw(colWidth) << "Secondary Rays"
 		<< " | " << std::setw(colWidth) << "Shadow Rays"
 		<< " | " << std::setw(colWidth) << "All Rays" << " | " << std::endl;
@@ -666,6 +671,29 @@ void ClearMesh()
 	triCount = 0;
 }
 
+// Places cameras on a sphere centered in the middle of a mesh
+void GenerateViewPoints() {
+	// Find Bounding box of all vertices (DOBB only fits loosely)
+	bvhvec3 minBounds(BVH_FAR, BVH_FAR, BVH_FAR), maxBounds(-BVH_FAR, -BVH_FAR, -BVH_FAR);
+	for (int vertIdx = 0; vertIdx < triCount * 3; vertIdx++) {
+		minBounds = tinybvh_min(minBounds, bvhvec3(tris[vertIdx]));
+		maxBounds = tinybvh_max(maxBounds, bvhvec3(tris[vertIdx]));
+	}
+
+	const bvhvec3 center = (minBounds + maxBounds) * 0.5f;
+	const float camDist = tinybvh_length(maxBounds - minBounds) * 0.5f * 1.8f * 0.5f;
+
+	// Evenly spaced cameras (fibonacci sphere) via Claude
+	for (uint32_t pointIdx = 0; pointIdx < NUMBEROFVIEWPOINTS; pointIdx++) {
+		const float height = 1.0f - 2.0f * (pointIdx + 0.5f) / NUMBEROFVIEWPOINTS;
+		const float ringRadius = sqrtf(1.0f - height * height);
+		const float azimuth = pointIdx * 3.14159265f * (3.0f - sqrtf(5.0f)); // golden angle
+		const bvhvec3 direction(cosf(azimuth) * ringRadius, height, sinf(azimuth) * ringRadius);
+	
+		viewPointCameras[pointIdx].initCamera(center + (direction * camDist), -direction);
+	}
+}
+
 // ---------------------- BUILD BVH ----------------------
 
 // Build BVHs and then set their c_trav and c_int values to 1.0
@@ -703,20 +731,24 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 	for (uint32_t i = 0; i < threadCount; i++)
 		primHitStats.add(threadPrimHitStats[i]), secondHitStats.add(threadSecondHitStats[i]), shadowStats.add(threadShadowStats[i]);
 	// print frame time / rate in window title
-	char title[50];
+	char title[80];
 	snprintf(
 		title, sizeof(title), 
-		"tiny_bvh %s, spp: %d", 
-		scenes[sceneIdx].sceneName, spp
+		"%s, view %d/%d spp: %d", 
+		scenes[sceneIdx].sceneName, viewPointIdx + 1, NUMBEROFVIEWPOINTS, spp
 	);
 	fenster_update_title(&f, title);
 }
 
-void resetRender() {
+void resetStats() {
+	primHitStats.reset(); secondHitStats.reset(); shadowStats.reset();
+}
+
+void initViewPoint() {
+	cam = viewPointCameras[viewPointIdx];
+	
 	memset(accumulator, 0, sizeof(accumulator));
 	spp = 0;
-
-	primHitStats.reset(); secondHitStats.reset(); shadowStats.reset();
 }
 
 void Tick(float delta_time_s, fenster& f, uint32_t* buf)
@@ -731,23 +763,37 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		ClearMesh();
 		if (scene.meshPath[0]) AddMesh(scene.meshPath[0], 1, bvhvec3(0), 0xffffff);
 		if (scene.meshPath[1]) AddMesh(scene.meshPath[1], 1, bvhvec3(0), 0xffffff);
-		cam.initCamera(scene.eye, scene.view);
-		std::cout << "Building BVH for " << triCount << " triangles" << std::endl;
+		GenerateViewPoints();
+
 		// Build BVHs 
+		std::cout << "Building BVHs for " << triCount << " triangles" << std::endl;
 		InitBvhs();
 
-		// Swap to the next phase
+		// Init and swap to the next phase
+		viewPointIdx = 0;
+		resetStats();
+		initViewPoint();
+
 		phase = RENDERMBVH;
-		resetRender();
 		break;
 	}
 	case RENDERMBVH: {
 		RenderTick(dobbBvh.bvh8, delta_time_s, f, buf);
 		if (spp >= targetSpp)
 		{
-			printStats((std::string("MBVH8 BVH, scene: ") + scenes[sceneIdx].sceneName).c_str());
-			phase = RENDERDOBB;
-			resetRender();
+			if (++viewPointIdx < NUMBEROFVIEWPOINTS) {
+				initViewPoint();
+			}
+			else {
+				printStats((std::string("MBVH8 BVH, scene: ") + scenes[sceneIdx].sceneName).c_str());
+				
+				// Init and swap to the next phase
+				viewPointIdx = 0;
+				resetStats();
+				initViewPoint();
+
+				phase = RENDERDOBB;
+			}
 		}
 		break;
 	}
@@ -755,13 +801,19 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		RenderTick(dobbBvh, delta_time_s, f, buf);
 		if (spp >= targetSpp)
 		{
-			printStats((std::string("DOBB BVH, scene: ") + scenes[sceneIdx].sceneName).c_str());
-			phase = BUILD;
-			sceneIdx++;
-			if (sceneIdx >= sceneCount)
-			{
-				phase = END;
-				std::cout << "END" << std::endl;
+			if (++viewPointIdx < NUMBEROFVIEWPOINTS) {
+				initViewPoint();
+			}
+			else {
+				printStats((std::string("DOBB BVH, scene: ") + scenes[sceneIdx].sceneName).c_str());
+
+				phase = BUILD;
+				sceneIdx++;
+				if (sceneIdx >= sceneCount)
+				{
+					phase = END;
+					std::cout << "END" << std::endl;
+				}
 			}
 		}
 		break;
