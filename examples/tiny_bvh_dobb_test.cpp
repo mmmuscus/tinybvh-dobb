@@ -497,7 +497,7 @@ void printStats(const char* tableName) {
 		<< " | " << std::setw(colWidth) << primHitStats.triTests / guardedPrimRayCount
 		<< " | " << std::setw(colWidth) << secondHitStats.triTests / guardedSecondRayCount
 		<< " | " << std::setw(colWidth) << shadowStats.triTests / guardedShadowRayCount
-		<< " | " << std::setw(colWidth) << allStats.triTests / guardedAllRayCount << " | " << std::endl;
+		<< " | " << std::setw(colWidth) << allStats.triTests / guardedAllRayCount << " | " << std::endl << std::endl;
 }
 
 // ---------------------- RENDERING ----------------------
