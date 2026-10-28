@@ -19,6 +19,7 @@ using namespace tinybvh;
 #endif
 #include <iostream>
 #include <iomanip>
+#include <string>
 
 enum Phase {
 	BUILD,
@@ -51,7 +52,7 @@ struct TraversalStats {
 		std::cout << std::fixed << std::setprecision(3) <<
 			statName << " " << rayCount << std::endl <<
 			"Avg nodes visited per ray: " << nodeVisits / guardedRayCount << std::endl <<
-			"Avg boxes intersected per ray: " << (boxTests / guardedRayCount) << std::endl <<
+			"Avg boxes intersected per ray: " << boxTests / guardedRayCount << std::endl <<
 			"Avg triangles intersected per ray: " << triTests / guardedRayCount << std::endl;
 	}
 };
@@ -85,11 +86,11 @@ struct SceneSetup {
 };
 
 static const SceneSetup scenes[] = {
-	{"HAIRBALL",		{"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
-	{"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
-	{"WHITE_OAK",		{"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
-	{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
-	{"DRAGON",			{"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
+	//{"HAIRBALL",		{"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	//{"BISTRO_EXTERIOR", {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
+	//{"WHITE_OAK",		{"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
+	//{"POWERPLANT",		{"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
+	//{"DRAGON",			{"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
 	{"CRYTEKSPONZA",	{"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
 };
 static const int sceneCount = sizeof(scenes) / sizeof(scenes[0]);
@@ -458,6 +459,47 @@ bool isOccludedInstrumented(const MBVH <8>& bvh8, const Ray& ray, TraversalStats
 	return false;
 }
 
+void printStats(const char* tableName) {
+	std::cout << std::fixed << std::setprecision(3);
+
+	TraversalStats allStats;
+	allStats.add(primHitStats); allStats.add(secondHitStats); allStats.add(shadowStats);
+
+	// Guards against division by 0
+	const double guardedPrimRayCount = primHitStats.rayCount ? (double)primHitStats.rayCount : 1.0f;
+	const double guardedSecondRayCount = secondHitStats.rayCount ? (double)secondHitStats.rayCount : 1.0f;
+	const double guardedShadowRayCount = shadowStats.rayCount ? (double)shadowStats.rayCount : 1.0f;
+	const double guardedAllRayCount = allStats.rayCount ? (double)allStats.rayCount : 1.0f;
+
+	const int firstColWidth = 35, colWidth = 15;
+
+	std::cout << std::left << std::setw(firstColWidth) << tableName << std::right
+		<< " | " << std::setw(colWidth) << "Pirmary Rays"
+		<< " | " << std::setw(colWidth) << "Secondary Rays"
+		<< " | " << std::setw(colWidth) << "Shadow Rays"
+		<< " | " << std::setw(colWidth) << "All Rays" << " | " << std::endl;
+	std::cout << std::left << std::setw(firstColWidth) << "Number of rays:" << std::right
+		<< " | " << std::setw(colWidth) << primHitStats.rayCount
+		<< " | " << std::setw(colWidth) << secondHitStats.rayCount
+		<< " | " << std::setw(colWidth) << shadowStats.rayCount
+		<< " | " << std::setw(colWidth) << allStats.rayCount << " | " << std::endl;
+	std::cout << std::left << std::setw(firstColWidth) << "Avg nodes visited per ray:" << std::right
+		<< " | " << std::setw(colWidth) << primHitStats.nodeVisits / guardedPrimRayCount
+		<< " | " << std::setw(colWidth) << secondHitStats.nodeVisits / guardedSecondRayCount
+		<< " | " << std::setw(colWidth) << shadowStats.nodeVisits / guardedShadowRayCount
+		<< " | " << std::setw(colWidth) << allStats.nodeVisits / guardedAllRayCount << " | " << std::endl;
+	std::cout << std::left << std::setw(firstColWidth) << "Avg boxes intersected per ray:" << std::right
+		<< " | " << std::setw(colWidth) << primHitStats.boxTests / guardedPrimRayCount
+		<< " | " << std::setw(colWidth) << secondHitStats.boxTests / guardedSecondRayCount
+		<< " | " << std::setw(colWidth) << shadowStats.boxTests / guardedShadowRayCount
+		<< " | " << std::setw(colWidth) << allStats.boxTests / guardedAllRayCount << " | " << std::endl;
+	std::cout << std::left << std::setw(firstColWidth) << "Avg triangles intersected per ray:" << std::right
+		<< " | " << std::setw(colWidth) << primHitStats.triTests / guardedPrimRayCount
+		<< " | " << std::setw(colWidth) << secondHitStats.triTests / guardedSecondRayCount
+		<< " | " << std::setw(colWidth) << shadowStats.triTests / guardedShadowRayCount
+		<< " | " << std::setw(colWidth) << allStats.triTests / guardedAllRayCount << " | " << std::endl;
+}
+
 // ---------------------- RENDERING ----------------------
 // Multi-threading
 static unsigned threadCount = std::thread::hardware_concurrency();
@@ -703,13 +745,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		RenderTick(dobbBvh.bvh8, delta_time_s, f, buf);
 		if (spp >= targetSpp)
 		{
-			std::cout << "MBVH8 BVH, scene: " << scenes[sceneIdx].sceneName << std::endl;
-			primHitStats.print("Primary rays");
-			secondHitStats.print("Secondary rays");
-			shadowStats.print("Shadow rays");
-			primHitStats.add(shadowStats);
-			primHitStats.add(secondHitStats);
-			primHitStats.print("All rays");
+			printStats((std::string("MBVH8 BVH, scene: ") + scenes[sceneIdx].sceneName).c_str());
 			phase = RENDERDOBB;
 			resetRender();
 		}
@@ -719,13 +755,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		RenderTick(dobbBvh, delta_time_s, f, buf);
 		if (spp >= targetSpp)
 		{
-			std::cout << "DOBB BVH, scene: " << scenes[sceneIdx].sceneName << std::endl;
-			primHitStats.print("Primary rays");
-			secondHitStats.print("Secondary rays");
-			shadowStats.print("Shadow rays");
-			primHitStats.add(shadowStats);
-			primHitStats.add(secondHitStats);
-			primHitStats.print("All rays");
+			printStats((std::string("DOBB BVH, scene: ") + scenes[sceneIdx].sceneName).c_str());
 			phase = BUILD;
 			sceneIdx++;
 			if (sceneIdx >= sceneCount)
