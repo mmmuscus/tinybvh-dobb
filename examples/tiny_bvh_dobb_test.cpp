@@ -719,6 +719,7 @@ void GenerateViewPoints(float viewPointRadiusScale = 1.0f) {
 void InitBvhs() 
 {
 	dobbBvh.Build(tris, triCount);
+	dobbBvh.convertMBVHToCompressedBounds();
 }
 
 // ---------------------- MISC ----------------------
