@@ -414,8 +414,6 @@ namespace tinybvh {
 		int32_t Intersect(Ray& ray) const;
 		bool IsOccluded(const Ray& ray) const;
 
-		void convertMBVHToCompressedBounds();
-
 		static DOBB_LUT getLut() { return lut; }
 		static DOBB_LUT::Mat3f getLutEntry(uint32_t idx) { return lut.getRawEntry(idx); }
 
@@ -710,59 +708,6 @@ namespace tinybvh {
 
 		AlignedFree(wideToBinary);
 		AlignedFree(table);
-	}
-
-	void BVH_DOBB::convertMBVHToCompressedBounds() {
-		for (uint32_t nodeIdx = 0; nodeIdx < bvh8.usedNodes; nodeIdx++) {
-			const MBVH<8>::MBVHNode& currNode = bvh8.mbvhNode[nodeIdx];
-
-			if (!currNode.isLeaf()) {
-				// Find min and max points for parent node
-				bvhvec3 minPoint{ BVH_FAR, BVH_FAR, BVH_FAR };
-				bvhvec3 maxPoint{ -BVH_FAR, -BVH_FAR, -BVH_FAR };
-
-				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++) {
-					const MBVH <8>::MBVHNode& childNode = bvh8.mbvhNode[currNode.child[childIdx]];
-
-					minPoint = tinybvh_min(minPoint, childNode.aabbMin);
-					maxPoint = tinybvh_max(maxPoint, childNode.aabbMax);
-				}
-
-				// Quantize extent encompassed by min and max points
-				float stepSize[3], inverseScale[3];
-				for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++) {
-					// Using same code as in ConvertFrom
-					const float extent = maxPoint[axisIdx] - minPoint[axisIdx];
-
-					int32_t exponent = extent > 0.0f ? (int32_t)ceilf(log2f(extent / 255.0f)) : -126;
-					exponent = tinybvh_clamp(exponent, -126, 127);
-
-					if (exponent < 127 && ldexpf(255.0f, exponent) < extent)
-						exponent++;
-
-					// Calculate stepsize and inverse stepsize
-					stepSize[axisIdx] = ldexpf(1.0, exponent);
-					inverseScale[axisIdx] = ldexpf(1.0f, -exponent);
-				}
-
-				// Calculate quantized AABBs for MBVH
-				for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++) {
-					MBVH<8>::MBVHNode& childNode = bvh8.mbvhNode[currNode.child[childIdx]];
-
-					for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++) {
-						const uint8_t low = (uint8_t)tinybvh_clamp(
-							floorf((childNode.aabbMin[axisIdx] - minPoint[axisIdx]) * inverseScale[axisIdx]),
-							0.0f, 255.0f);
-						const uint8_t high = (uint8_t)tinybvh_clamp(
-							ceilf((childNode.aabbMax[axisIdx] - minPoint[axisIdx]) * inverseScale[axisIdx]),
-							0.0f, 255.0f);
-
-						childNode.aabbMin[axisIdx] = minPoint[axisIdx] + low * stepSize[axisIdx];
-						childNode.aabbMax[axisIdx] = minPoint[axisIdx] + high * stepSize[axisIdx];
-					}
-				}
-			}
-		}
 	}
 
 	void BVH_DOBB::ConvertFrom(const MBVH<8>& original)
