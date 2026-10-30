@@ -119,6 +119,75 @@ static std::atomic<int> tileIdx(0);
 
 // ---------------------- INSTRUMENTATION ----------------------
 
+static float BoxSurfaceArea(const bvhvec3& min, const bvhvec3& max) {
+	const bvhvec3 extent = max - min;
+	return 2.0f * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x);
+}
+
+struct StackEntryDepth { uint32_t nodeIdx; uint32_t depth; };
+
+void printMBVHSAH(const char* tableName) {
+	float internalSAs[128] = { 0.0f }, leafSAs[128] = { 0.0f };
+	const float rootSA = BoxSurfaceArea(dobbBvh.bvh8.mbvhNode[0].aabbMin, dobbBvh.bvh8.mbvhNode[0].aabbMax);
+
+	float totalInternalSA = 0.0f, totalLeafSA = 0.0f;
+	StackEntryDepth nodeStack[512];
+	uint32_t stackIdx = 0;
+	nodeStack[stackIdx++] = { 0, 0 };
+
+	uint32_t maxDepth = 0;
+
+	while (stackIdx > 0) {
+		const MBVH<8>::MBVHNode& currNode = dobbBvh.bvh8.mbvhNode[nodeStack[--stackIdx].nodeIdx];
+		const float nodeSA = BoxSurfaceArea(currNode.aabbMin, currNode.aabbMax);
+
+		maxDepth = tinybvh_max(maxDepth, nodeStack[stackIdx].depth);
+
+		if (currNode.isLeaf()) {
+			totalLeafSA += nodeSA;
+			leafSAs[nodeStack[stackIdx].depth] += nodeSA;
+		}
+		else {
+			totalInternalSA += nodeSA;
+			internalSAs[nodeStack[stackIdx].depth] += nodeSA;
+
+			const uint32_t nextDepth = nodeStack[stackIdx].depth + 1;
+
+			for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++) {
+				nodeStack[stackIdx++] = { currNode.child[childIdx], nextDepth };
+			}
+		}
+	}
+
+	static const int firstColWidth = 16, colWidth = 8;
+
+	std::cout << std::fixed << std::setprecision(3);
+
+	std::cout << std::fixed << std::setprecision(3);
+
+	std::cout << std::left << std::setw(firstColWidth) << tableName << std::right
+		<< " | " << std::setw(colWidth) << "Internal"
+		<< " | " << std::setw(colWidth) << "Leaf"
+		<< " | " << std::setw(colWidth) << "All" << " | " << std::endl;
+	std::cout << std::left << std::setw(firstColWidth) << "Total SAH:" << std::right
+		<< " | " << std::setw(colWidth) << totalInternalSA / rootSA
+		<< " | " << std::setw(colWidth) << totalLeafSA / rootSA
+		<< " | " << std::setw(colWidth) << (totalInternalSA + totalLeafSA) / rootSA << " | " << std::endl;
+
+	for (uint32_t depth = 0; depth <= maxDepth; depth++) {
+		const std::string depthLabel = "SAH at depth " + std::to_string(depth) + ":";
+		std::cout << std::left << std::setw(firstColWidth) << depthLabel << std::right
+			<< " | " << std::setw(colWidth) << internalSAs[depth] / rootSA
+			<< " | " << std::setw(colWidth) << leafSAs[depth] / rootSA
+			<< " | " << std::setw(colWidth) << (internalSAs[depth] + leafSAs[depth]) / rootSA << " | " << std::endl;
+	}
+	std::cout << std::endl;
+}
+
+void printDOBBSAHAndStats() {
+
+}
+
 // Same signature and behaviour as BVHBase::IntersectTri (Möller–Trumbore, no opacity maps)
 static void IntersectTri(Ray& ray, const uint32_t triIdx, const bvhvec4slice& verts,
 	const uint32_t i0, const uint32_t i1, const uint32_t i2)
@@ -835,7 +904,7 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		const SceneSetup& scene = scenes[sceneIdx];
 
 		// Reset and load next mesh to be tested
-		std::cout << " -------------------------------------------- " << std::endl;
+		std::cout << "-------------------------------------------------" << std::endl;
 		std::cout << "Loading scene: " << scene.sceneName << std::endl;
 		ClearMesh();
 		if (scene.meshPath[0]) AddMesh(scene.meshPath[0], 1, bvhvec3(0), 0xffffff);
@@ -845,6 +914,9 @@ void Tick(float delta_time_s, fenster& f, uint32_t* buf)
 		// Build BVHs 
 		std::cout << "Building BVHs for " << triCount << " triangles" << std::endl;
 		InitBvhs();
+
+		// Print stats of BVHs
+		printMBVHSAH("MBVH8 Nodes");
 
 		// Init and swap to the next phase
 		viewPointIdx = 0;
