@@ -2065,21 +2065,10 @@ public:
 	Index allocatedPrimIndices = 0;		// size of the dobbPrimIdx allocation.
 	MBVH8 bvh8;							// BVH_DOBB is created from MBVH<8> and uses its data.
 	bool ownBVH8 = true;				// false when ConvertFrom receives an external bvh8.
-	bool forceInternalAABB = false;		// experiments: never rotate nodes without leaf children.
+	// BVH_DOBB specific build settings
+	bool forceInternalAABB = false;		// force nodes without leaf children to be unoriented AABB-s
 private:
-	struct WideningData
-	{
-		// per binary node table for SAH-optimal widening (Ylitie et al., 2017).
-		float cost[8];					// cost[slots - 1] = C(n, slots).
-		uint8_t leftSlots[8];			// slots >= 2: split of Distribute(n, slots); 0: fewer slots was cheaper.
-		uint8_t internalLeftSlots;		// split of Distribute(n, 8), used when n becomes a wide interior node.
-		bool asLeaf;					// decision for C(n, 1).
-		Index firstTri, triCount;		// the subtree's contiguous range in primIdx.
-	};
 	void Quadify();
-	void WidenSAHOptimal();
-	void GatherSlots( const WideningData* table, const Index binaryIdx, const uint32_t slots,
-		Index* slotNodes, uint32_t& slotCount ) const;
 	static void CalcBasisVectorsFromTri( const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2 );
 };
 
@@ -8358,14 +8347,16 @@ TEMPLATED void BVH_DOBB<Float, Index>::Build( const Slice& vertices, const Index
 {
 	// a tree received through ConvertFrom is not ours to rebuild: drop the reference, start afresh.
 	if (!ownBVH8) bvh8.DropReference( context ), ownBVH8 = true;
+	BVH_FATAL_ERROR_IF(settings.useSpatialSplits, "BVH_DOBB::Build( .. ), spatial splits are not supported.");
+	BVH_FATAL_ERROR_IF(settings.usePresplitting, "BVH_DOBB::Build( .. ), presplitting is not supported.");
 	// propagate settings for this layout to the underlying layout
 	this->PassSettingsTo( bvh8 ), this->PassSettingsTo( bvh8.bvh );
-	// build the binary BVH: full-sweep SAH, which keeps the node list ordered.
-	bvh8.bvh.settings.useFullSweep = true;
 	bvh8.bvh.Build( vertices, indices, primCount );
-	// leaves with at most 2 triangles, then SAH-optimal widening to 8
+	// Make sure leaf nodes have at most 2 triangles (runs even if that is already true)
 	Quadify();
-	WidenSAHOptimal();
+	// Build 8-wide BVH using SAH-optimal widening
+	bvh8.leafPrimLimit = 2;
+	bvh8.ConvertFrom(bvh8.bvh);
 	// create the oriented tree
 	ConvertFrom( bvh8 );
 }
@@ -8421,127 +8412,6 @@ TEMPLATED void BVH_DOBB<Float, Index>::Quadify()
 	}
 	bvh.usedNodes = bvh.newNodePtr, bvh.leafsSplit = 2;
 	bvh.Refit(); // the split nodes copied the bounds of their parent.
-}
-
-// GatherSlots: follow the stored Distribute decisions down to one-slot entries.
-// Part of SAH-optimal widening (Ylitie et al., 2017); written with Claude.
-TEMPLATED void BVH_DOBB<Float, Index>::GatherSlots( const WideningData* table, const Index binaryIdx, const uint32_t slots,
-	Index* slotNodes, uint32_t& slotCount ) const
-{
-	// one slot: this binary node becomes a child of the wide node
-	if (slots == 1) { slotNodes[slotCount++] = binaryIdx; return; }
-	const uint8_t leftSlots = table[binaryIdx].leftSlots[slots - 1];
-	// fewer slots was cheaper
-	if (leftSlots == 0) { GatherSlots( table, binaryIdx, slots - 1, slotNodes, slotCount ); return; }
-	// share the slots between the two binary children
-	const Index leftChildIdx = bvh8.bvh.bvhNode[binaryIdx].leftFirst;
-	GatherSlots( table, leftChildIdx, leftSlots, slotNodes, slotCount );
-	GatherSlots( table, leftChildIdx + 1, slots - leftSlots, slotNodes, slotCount );
-}
-
-// WidenSAHOptimal: collapse the binary bvh8.bvh into bvh8 with minimal SAH cost.
-// Based on "Efficient Incoherent Ray Traversal on GPUs Through Compressed Wide BVHs",
-// Ylitie et al. 2017; written with Claude.
-TEMPLATED void BVH_DOBB<Float, Index>::WidenSAHOptimal()
-{
-	BVH& bvh = bvh8.bvh;
-	BVH_FATAL_ERROR_IF( bvh.bvhNode[0].isLeaf(), "BVH_DOBB::WidenSAHOptimal(), binary root is a leaf." );
-	const float traversalCost = bvh.c_trav, intersectionCost = bvh.c_int;
-	WideningData* table = (WideningData*)AlignedAlloc( bvh.usedNodes * sizeof( WideningData ) );
-	// pass 1: bottom-up costs. A child always has a higher index than its parent.
-	for (int64_t nodeIdx = (int64_t)bvh.usedNodes - 1; nodeIdx >= 0; nodeIdx--)
-	{
-		if (nodeIdx == 1) continue; // node 1 is unused.
-		const typename BVH::BVHNode& node = bvh.bvhNode[nodeIdx];
-		WideningData& entry = table[nodeIdx];
-		const bvhvec3 extent = node.aabbMax - node.aabbMin;
-		const float area = 2.0f * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x);
-		if (node.isLeaf())
-		{
-			// binary leaf: can't be split, so the cost is the same for every slot budget.
-			const float leafCost = area * node.triCount * intersectionCost;
-			for (uint32_t slots = 1; slots <= 8; slots++) entry.cost[slots - 1] = leafCost, entry.leftSlots[slots - 1] = 0;
-			entry.internalLeftSlots = 0, entry.asLeaf = true;
-			entry.firstTri = node.leftFirst, entry.triCount = node.triCount;
-			continue;
-		}
-		const WideningData& leftEntry = table[node.leftFirst];
-		const WideningData& rightEntry = table[node.leftFirst + 1];
-		entry.firstTri = tinybvh_min( leftEntry.firstTri, rightEntry.firstTri );
-		entry.triCount = leftEntry.triCount + rightEntry.triCount;
-		// Distribute(n, slots): share the slots between the two children
-		float distributeCost[9];
-		uint8_t distributeLeftSlots[9];
-		for (uint32_t slots = 2; slots <= 8; slots++)
-		{
-			distributeCost[slots] = BVH_FAR, distributeLeftSlots[slots] = 1;
-			for (uint32_t leftSlots = 1; leftSlots < slots; leftSlots++)
-			{
-				const float splitCost = leftEntry.cost[leftSlots - 1] + rightEntry.cost[slots - leftSlots - 1];
-				if (splitCost < distributeCost[slots]) distributeCost[slots] = splitCost, distributeLeftSlots[slots] = (uint8_t)leftSlots;
-			}
-		}
-		// C(n, 1): one MBVH leaf, or one wide interior node
-		const float leafCost = entry.triCount <= 2 ? area * entry.triCount * intersectionCost : BVH_FAR;
-		const float internalCost = area * traversalCost + distributeCost[8];
-		entry.asLeaf = leafCost <= internalCost;
-		entry.cost[0] = entry.asLeaf ? leafCost : internalCost;
-		entry.leftSlots[0] = 0;
-		entry.internalLeftSlots = distributeLeftSlots[8];
-		// C(n, slots): split across the children, or use fewer slots
-		for (uint32_t slots = 2; slots <= 8; slots++)
-		{
-			if (distributeCost[slots] < entry.cost[slots - 2])
-				entry.cost[slots - 1] = distributeCost[slots], entry.leftSlots[slots - 1] = distributeLeftSlots[slots];
-			else
-				entry.cost[slots - 1] = entry.cost[slots - 2], entry.leftSlots[slots - 1] = 0;
-		}
-	}
-	// set up bvh8 as MBVH::ConvertFrom would; each wide node corresponds to a distinct binary
-	// node, so usedNodes nodes suffice.
-	bvh8.CopyBasePropertiesFrom( bvh );
-	if (bvh8.allocatedNodes < bvh.usedNodes)
-	{
-		bvh8.AlignedFree( bvh8.mbvhNode );
-		bvh8.mbvhNode = (typename MBVH8::MBVHNode*)bvh8.AlignedAlloc( bvh.usedNodes * sizeof( typename MBVH8::MBVHNode ) );
-		bvh8.allocatedNodes = bvh.usedNodes;
-	}
-	// pass 2: top-down, breadth-first; the mbvhNode array doubles as the queue.
-	Index* wideToBinary = (Index*)AlignedAlloc( bvh.usedNodes * sizeof( Index ) );
-	wideToBinary[0] = 0;
-	Index wideNodeCount = 1;
-	for (Index wideIdx = 0; wideIdx < wideNodeCount; wideIdx++)
-	{
-		const Index binaryIdx = wideToBinary[wideIdx];
-		const typename BVH::BVHNode& binaryNode = bvh.bvhNode[binaryIdx];
-		const WideningData& entry = table[binaryIdx];
-		typename MBVH8::MBVHNode& wideNode = bvh8.mbvhNode[wideIdx];
-		memset( &wideNode, 0, sizeof( wideNode ) );
-		wideNode.aabbMin = binaryNode.aabbMin, wideNode.aabbMax = binaryNode.aabbMax;
-		// MBVH leaf; the root is always interior
-		if (wideIdx != 0 && entry.asLeaf)
-		{
-			wideNode.firstTri = entry.firstTri, wideNode.triCount = entry.triCount;
-			continue;
-		}
-		// wide interior node: its slots come from Distribute(n, 8)
-		Index slotNodes[8];
-		uint32_t slotCount = 0;
-		GatherSlots( table, binaryNode.leftFirst, entry.internalLeftSlots, slotNodes, slotCount );
-		GatherSlots( table, binaryNode.leftFirst + 1, 8 - entry.internalLeftSlots, slotNodes, slotCount );
-		// children get the next indices: breadth-first, child > parent, no holes
-		wideNode.childCount = slotCount;
-		for (uint32_t slot = 0; slot < slotCount; slot++)
-		{
-			wideToBinary[wideNodeCount] = slotNodes[slot];
-			wideNode.child[slot] = wideNodeCount++;
-		}
-	}
-	bvh8.usedNodes = wideNodeCount;
-	bvh8.hasHoles = false, bvh8.orderedNodes = true; // breadth-first, without holes.
-	// cleanup
-	AlignedFree( wideToBinary );
-	AlignedFree( table );
 }
 
 // Convert an MBVH<8> with at most 2 triangles per leaf to the DOBB layout. Pass 1 builds
