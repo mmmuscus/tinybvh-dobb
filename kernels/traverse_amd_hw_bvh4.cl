@@ -10,7 +10,16 @@ inline uint id_to_offset( uint id ) { return ( id & ( ~7u ) ) << 3; }
 inline uint id_to_type( uint id ) { return id & 7u; }
 
 #define TRIANGLE 0u
+#define PAIR 1u // a triangle node with two triangles: intersected as type 1, then as type 0
+#define BOX16 4u
 #define INVALID_NODE 0xffffffffu
+
+// TinyBVH parent ID of a node, for recovery from a hardware stack overflow.
+inline uint parent_id( const global uint* words, const uint nodeID, const uint box16Start, const uint parentTable )
+{
+	const uint type = id_to_type( nodeID ), offset = id_to_offset( nodeID );
+	return words[type == BOX16 ? parentTable + ( offset >> 6 ) - box16Start : ( offset >> 2 ) + ( type <= PAIR ? 14u : 31u )];
+}
 
 #define BVH_STACK_TERMINAL_NODE 0xfffffffeu
 #ifndef HW_BVH_STACK_ENTRIES
@@ -58,7 +67,10 @@ float4 traverse_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 					  ( lane >> 5 ) * ( 32u * HW_BVH_STACK_ENTRIES ) ) << HW_BVH_STACK_BASE_SHIFT;
 	float4 hit = (float4)( tmax, 0.0f, 0.0f, as_float( INVALID_NODE ) );
 
+	const global uint* words = (const global uint*)alt4Node;
+	const uint box16Start = words[29], parentTable = words[30]; // for parent_id
 	uint currentNodeID = 5; // start at root BOX32 node at byte offset zero.
+	uint pairID = INVALID_NODE; // the pair node whose second test (as type 0) is in progress
 	while (1)
 	{
 		uint2 stackResults;
@@ -68,7 +80,7 @@ float4 traverse_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 
 		uint lastVisited = BVH_STACK_TERMINAL_NODE;
 		uint type = id_to_type( currentNodeID );
-		if (type == TRIANGLE)
+		if (type <= PAIR)
 		{
 			float4 triData = as_float4( dst4 );
 			float invDet = native_recip( triData[1] );
@@ -77,7 +89,7 @@ float4 traverse_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 			const global uint* triWords =
 				(const global uint*)( (const global uchar*)alt4Node +
 									  id_to_offset( currentNodeID ) );
-			uint id = triWords[12];
+			uint id = triWords[12 + type]; // primitive of tri0 at byte 48, of tri1 at byte 52
 
 			if (t >= 0.0f && t <= hit.x)
 			{
@@ -89,6 +101,14 @@ float4 traverse_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 			#endif
 				hit = (float4)( t, u, v, as_float( id ) );
 			}
+			if (type == PAIR)
+			{
+				// test tri0 of the same node next, without a stack operation in between.
+				pairID = currentNodeID, currentNodeID &= ~7u;
+				continue;
+			}
+			// the parent refers to a pair by its type 1 ID; a stack recovery below must see that.
+			if (pairID != INVALID_NODE) currentNodeID = pairID, pairID = INVALID_NODE;
 			stackResults = __builtin_amdgcn_ds_bvh_stack_push4_pop1_rtn(
 				stackAddr, BVH_STACK_TERMINAL_NODE, (uint4)INVALID_NODE, BVH_STACK_CONTROLS );
 		}
@@ -118,19 +138,7 @@ float4 traverse_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 		stackAddr += 1u;
 	#endif
 		prevNode = currentNodeID;
-		uint parentID;
-		const global uint* words =
-			(const global uint*)( (const global uchar*)alt4Node +
-								  id_to_offset( currentNodeID ) );
-		if (type == TRIANGLE)
-		{
-			parentID = words[14]; // TinyBVH parent ID at byte 56
-		}
-		else
-		{
-			parentID = words[31]; // TinyBVH parent ID at byte 124.
-		}
-		currentNodeID = parentID;
+		currentNodeID = parent_id( words, currentNodeID, box16Start, parentTable );
 
 		if (currentNodeID == INVALID_NODE)
 		{
@@ -149,7 +157,10 @@ bool isoccluded_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 	uint stackAddr = ( ( (uint)(size_t)hwStack >> 2 ) + ( lane & 31u ) +
 					  ( lane >> 5 ) * ( 32u * HW_BVH_STACK_ENTRIES ) ) << HW_BVH_STACK_BASE_SHIFT;
 
+	const global uint* words = (const global uint*)alt4Node;
+	const uint box16Start = words[29], parentTable = words[30]; // for parent_id
 	uint currentNodeID = 5; // start at root BOX32 node at byte offset zero.
+	uint pairID = INVALID_NODE; // the pair node whose second test (as type 0) is in progress
 	while (1)
 	{
 		uint2 stackResults;
@@ -158,12 +169,18 @@ bool isoccluded_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 			currentPointer, tmax, O, D, rD, BVH_DESCRIPTOR );
 
 		uint type = id_to_type( currentNodeID );
-		if (type == TRIANGLE)
+		if (type <= PAIR)
 		{
 			const float4 triData = as_float4( dst4 );
 			// Check the ray interval explicitly, using the closest-hit result format.
 			const float t = triData.x * native_recip( triData.y );
 			if (isfinite( t ) && t >= 0.0f && t < tmax) return true;
+			if (type == PAIR)
+			{
+				pairID = currentNodeID, currentNodeID &= ~7u; // tri0 of the same node next
+				continue;
+			}
+			if (pairID != INVALID_NODE) currentNodeID = pairID, pairID = INVALID_NODE;
 			stackResults = __builtin_amdgcn_ds_bvh_stack_push4_pop1_rtn(
 				stackAddr, BVH_STACK_TERMINAL_NODE, (uint4)INVALID_NODE, BVH_STACK_CONTROLS );
 		}
@@ -193,19 +210,7 @@ bool isoccluded_gpu4wayHW( const global float4* alt4Node, const float4 O, const 
 		stackAddr += 1u;
 		#endif
 		prevNode = currentNodeID;
-		uint parentID;
-		const global uint* words =
-			(const global uint*)( (const global uchar*)alt4Node +
-								  id_to_offset( currentNodeID ) );
-		if (type == TRIANGLE)
-		{
-			parentID = words[14]; // TinyBVH parent ID at byte 56
-		}
-		else
-		{
-			parentID = words[31]; // TinyBVH parent ID at byte 124.
-		}
-		currentNodeID = parentID;
+		currentNodeID = parent_id( words, currentNodeID, box16Start, parentTable );
 
 		if (currentNodeID == INVALID_NODE)
 		{

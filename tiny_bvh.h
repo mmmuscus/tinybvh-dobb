@@ -65,6 +65,7 @@ THE SOFTWARE.
 // TinyBVH can be further configured using #defines, to be specified before the #include:
 // #define BVHBINS 8        - the number of bins to use in regular BVH construction. Default is 8.
 // #define HQBVHBINS 32     - the number of bins to use in SBVH construction. Default is 8; at most MAXHQBINS (128).
+// #define MOTIONBVHBINS 16 - the number of bins to use in BVH_Motion construction. Default is 16.
 // #define INST_IDX_BITS 10 - the number of bits to use for the instance index. Default is 32,
 //                            which stores the bits in a separate field in tinybvh::Intersection.
 // #define C_INT 1          - the estimated cost of a primitive intersection test. Default is 0.9f.
@@ -100,10 +101,10 @@ THE SOFTWARE.
 // Library version:
 #define TINY_BVH_VERSION_MAJOR	1
 #define TINY_BVH_VERSION_MINOR	9
-#define TINY_BVH_VERSION_SUB	2
+#define TINY_BVH_VERSION_SUB	3
 
 // Cached BVH file version - increases only when file layout changes.
-#define TINY_BVH_CACHE_VERSION	19200
+#define TINY_BVH_CACHE_VERSION	19302
 
 // Features
 #ifndef NO_DOUBLE_PRECISION_SUPPORT
@@ -137,6 +138,9 @@ THE SOFTWARE.
 #endif
 #ifndef MAXHQBINS
 #define MAXHQBINS 128 // max value for hqbvhbins; one more than that with hqbvhoddeven.
+#endif
+#ifndef MOTIONBVHBINS
+#define MOTIONBVHBINS 16
 #endif
 
 // Stack size for all CPU-side traversal functions.
@@ -402,12 +406,18 @@ template class impl::BVH_Verbose<float, uint32_t>;
 template class impl::BVH_GPU<float, uint32_t>;
 template class impl::MBVH<4, float, uint32_t>;
 template class impl::MBVH<8, float, uint32_t>;
+template class impl::MBVH<6, float, uint32_t>;
+template class impl::MBVH<12, float, uint32_t>;
 template class impl::BVH4_GPU<float, uint32_t>;
 template class impl::BVH4_AMD_HW<float, uint32_t>;
 template class impl::CWBVH8_AMD_HW<float, uint32_t>;
+template class impl::BVH6_INTEL_HW<float, uint32_t>;
+template class impl::BVH12_NVIDIA_HW<float, uint32_t>;
 template class impl::BVH4_CPU<float, uint32_t>;
 template class impl::BVH8_CWBVH<float, uint32_t>;
 template class impl::BVH8_CPU<float, uint32_t>;
+template class impl::BVH_DOBB<float, uint32_t>;
+template class impl::BVH_Motion<float, uint32_t>;
 template class impl::BLASInstance<float, uint32_t>;
 #ifdef DOUBLE_PRECISION_SUPPORT
 template class impl::BVHBase<double, uint64_t>;
@@ -415,6 +425,7 @@ template class impl::BVH<double, uint64_t>;
 template class impl::BVH_Verbose<double, uint64_t>;
 template class impl::MBVH<4, double, uint64_t>;
 template class impl::BVH4_CPU<double, uint64_t>;
+template class impl::BVH_Motion<double, uint64_t>;
 template class impl::BLASInstance<double, uint64_t>;
 #endif
 

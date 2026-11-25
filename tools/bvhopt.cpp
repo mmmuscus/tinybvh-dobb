@@ -51,14 +51,38 @@ static const char* g_metricName[3] = { "sah", "epo", "raycost" };
 enum ProfileLevel : uint32_t { PROF_FAST = 0, PROF_HQ, PROF_EXTREME };
 static const char* g_profileName[3] = { "fast", "hq", "extreme" };
 
+// TIE_EPS: two costs this close, relative to the smaller, are the same cost. Every stage adds the
+// same terms in its own order, so an arrangement that costs what the current one costs comes back
+// a few ulps cheaper or dearer: on Sponza, half the treelets the DP 'improved' at zero temperature
+// did so by less than this. A cold move inside the band is a tie, and is not taken: it buys
+// nothing and reshapes the tree. A hot one is a sideways step, and is taken as before - the
+// annealed walk needs those to cross a plateau, and refusing them cost half a percent of SAH on
+// Sponza. Breaking ties towards the shallower candidate was tried as well, and cost measured
+// traversal on Sponza without buying anything the depth limit does not already guarantee.
+static const float TIE_EPS = 1e-6f;
+
+// MAX_DEPTH: no leaf sits deeper than this below the root. The library's traversal kernels and
+// every walk in this file keep a stack of TINYBVH_STACK_SIZE entries, and a binary walk needs one
+// entry per level, so this is the deepest tree that can be walked at all. -maxdepth lowers it.
+static const uint32_t MAX_DEPTH = TINYBVH_STACK_SIZE;
+
+// CeilLog2: the levels a balanced binary tree over n leaves needs.
+static uint32_t CeilLog2( const uint32_t n )
+{
+	uint32_t r = 0;
+	while (r < 32 && (1ull << r) < (uint64_t)n) r++;
+	return r;
+}
+
 // AnnealAccept: the acceptance rule, in one place, for every descent in this file. A move that
 // lowers the objective is always taken; one that raises it by 'delta' is taken with probability
 // exp( -delta / T ), which is zero when the temperature is. Every objective here is in units of
-// area times cost, and so is T, which makes the ratio scale free.
+// area times cost, and so is T, which makes the ratio scale free. A cold tie is neither: see
+// TIE_EPS.
 static bool AnnealAccept( const float proposed, const float current, const float T, uint32_t& seed )
 {
+	if (!(T > 0)) return proposed < current - TIE_EPS * tinybvh::tinybvh_min( fabsf( proposed ), fabsf( current ) );
 	if (proposed < current) return true;
-	if (!(T > 0)) return false;
 	const float delta = proposed - current;
 	if (!(delta < 20.0f * T)) return false;	// also catches the infinities a failed move returns
 	return tinybvh::tinybvh_rndfloat( seed ) < expf( -delta / T );
@@ -180,6 +204,7 @@ public:
 		uint32_t exactBottomSize = 10;	// replace maximal subtrees of at most this many references by the
 										// provably optimal BVH over them. 0 disables; at most MAX_EXACT.
 		uint32_t maxLeafPrims = 4;		// final leaf collapse budget. 1 for a pure BVH2; 4 for BVH4_CPU.
+		uint32_t maxDepth = MAX_DEPTH;	// no leaf deeper than this below the root; see MAX_DEPTH.
 		// EPO predicts traversal cost better than SAH but is three orders of magnitude more
 		// expensive to evaluate, so it enters as an estimate read from a density field, with an
 		// optional exact whole-tree gate once per round.
@@ -222,6 +247,9 @@ private:
 		float primArea, rootArea;
 		float* ownArea;			// primitive area below each node, which its own box fully contains
 		float lambda;			// converts estimated foreign area into the units of surface area
+		uint32_t* height;		// levels below each node: 0 for a leaf
+		uint32_t* depth;		// levels above each node: 0 for the root. Set by OptExComputeCosts.
+		uint32_t* tHgt;			// treelet DP: height of the winning topology per subset
 	};
 	void OptExRefitUp( uint32_t nodeIdx );
 	void OptExComputeCosts( State& st );
@@ -232,9 +260,13 @@ private:
 	float SAHCostUp( uint32_t nodeIdx ) const;
 	uint32_t FindBestNewPosition( const uint32_t Lid, float& bestCost ) const;
 	void OptimizeSerial( const uint32_t iterations, const bool extreme, bool stochastic, uint32_t seed, float temp0 );
-	uint32_t OptExSweepSplit( uint32_t* leaf, const uint32_t count, const float jitter, uint32_t& seed, State& st );
+	uint32_t OptExSweepSplit( uint32_t* leaf, const uint32_t count, const uint32_t kLo, const uint32_t kHi,
+		const float jitter, uint32_t& seed, State& st );
 	uint32_t OptExBuildTopology( uint32_t* leaf, const uint32_t count, uint32_t* slots, uint32_t& slotPtr,
-		const uint32_t parent, const float jitter, uint32_t& seed, float& interiorCost, State& st );
+		const uint32_t parent, const float jitter, uint32_t& seed, float& interiorCost, State& st, const uint32_t budget );
+	void PropagateHeight( const uint32_t nodeIdx, State& st );
+	uint32_t EnforceDepth( State& st );
+	uint32_t KeepDepth( State& st, const char* after );
 	void OptExExplode( const Ref* refBox, State& st );
 	bool OptExTreelet( const uint32_t nodeIdx, const uint32_t maxL, State& st, float T );
 	bool OptExTreeletAgglom( const uint32_t nodeIdx, const uint32_t maxL, State& st, float T );
@@ -324,7 +356,7 @@ void Optimizer::OptExComputeCosts( State& st )
 		if (n.isLeaf())
 		{
 			st.subCost[nodeIdx] = b.c_int * EffArea( n.aabbMin, n.aabbMax, st.ownArea[nodeIdx], st ) * (float)n.triCount;
-			st.refCount[nodeIdx] = n.triCount;
+			st.refCount[nodeIdx] = n.triCount, st.height[nodeIdx] = 0;
 			if (stackPtr == 0) break;
 			nodeIdx = stack[--stackPtr];
 			continue;
@@ -332,6 +364,13 @@ void Optimizer::OptExComputeCosts( State& st )
 		st.order[st.orderCount++] = nodeIdx;
 		BVH_FATAL_ERROR_IF( stackPtr == STACK_SIZE, "BVH_Verbose::OptimizeEx, tree too deep." );
 		stack[stackPtr++] = n.right, nodeIdx = n.left;
+	}
+	// depths, top-down: the list is in pre-order, so every parent comes before its children.
+	st.depth[0] = 0;
+	for (uint32_t i = 0; i < st.orderCount; i++)
+	{
+		const Node& node = b.bvhNode[st.order[i]];
+		st.depth[node.left] = st.depth[node.right] = st.depth[st.order[i]] + 1;
 	}
 	for (uint32_t i = st.orderCount; i-- > 0; )
 	{
@@ -341,14 +380,113 @@ void Optimizer::OptExComputeCosts( State& st )
 		st.subCost[n] = b.c_trav * EffArea( node.aabbMin, node.aabbMax, st.ownArea[n], st )
 			+ st.subCost[node.left] + st.subCost[node.right];
 		st.refCount[n] = st.refCount[node.left] + st.refCount[node.right];
+		st.height[n] = 1 + tinybvh::tinybvh_max( st.height[node.left], st.height[node.right] );
 	}
+}
+
+// PropagateHeight: after a subtree changed shape, carry its new height up the ancestry, stopping
+// at the first ancestor whose height comes out the same.
+void Optimizer::PropagateHeight( const uint32_t nodeIdx, State& st )
+{
+	for (uint32_t p = b.bvhNode[nodeIdx].parent; p != (uint32_t)-1; p = b.bvhNode[p].parent)
+	{
+		const Node& n = b.bvhNode[p];
+		const uint32_t h = 1 + tinybvh::tinybvh_max( st.height[n.left], st.height[n.right] );
+		if (h == st.height[p]) break;
+		st.height[p] = h;
+	}
+}
+
+// EnforceDepth: no leaf deeper than s.maxDepth below the root. The treelet passes and the
+// rebuilds respect the limit as they go; reinsertion moves subtrees anywhere and cannot cheaply
+// be made to, and neither can a tree that was handed in, so this runs after those, after every
+// round and once more at the end. On a tree that fits it is one walk and changes nothing, which
+// is every tree a sane scene produces. Otherwise it rebuilds, with the depth-budgeted sweep and
+// in their own slots, the deepest subtrees that can still be made to fit in the levels left above
+// them: deeper means fewer nodes moved. Its walks keep their stacks on the heap, since the tree
+// it is handed is by definition one the fixed stacks elsewhere may not survive. Returns the
+// number of subtrees it rebuilt.
+uint32_t Optimizer::EnforceDepth( State& st )
+{
+	if (b.bvhNode[0].isLeaf()) return 0;
+	std::vector<uint32_t> pre, depth( b.usedNodes, 0 ), stack( 1, 0u );
+	pre.reserve( b.usedNodes );
+	uint32_t deepest = 0;
+	while (!stack.empty())
+	{
+		const uint32_t n = stack.back();
+		stack.pop_back(), pre.push_back( n );
+		const Node& node = b.bvhNode[n];
+		if (node.isLeaf()) { deepest = tinybvh::tinybvh_max( deepest, depth[n] ); continue; }
+		depth[node.left] = depth[node.right] = depth[n] + 1;
+		stack.push_back( node.right ), stack.push_back( node.left );
+	}
+	if (deepest <= s.maxDepth) return 0;
+	std::vector<uint32_t> height( b.usedNodes, 0 ), leaves( b.usedNodes, 1 );
+	for (size_t i = pre.size(); i-- > 0; )
+	{
+		const uint32_t n = pre[i];
+		const Node& node = b.bvhNode[n];
+		if (node.isLeaf()) continue;
+		height[n] = 1 + tinybvh::tinybvh_max( height[node.left], height[node.right] );
+		leaves[n] = leaves[node.left] + leaves[node.right];
+	}
+	// a limit below what a balanced tree over every leaf needs cannot be met by anything.
+	const uint32_t limit = tinybvh::tinybvh_max( s.maxDepth, CeilLog2( leaves[0] ) );
+	if (deepest <= limit) return 0;
+	// a subtree can be made to fit if a balanced tree over its leaves fits below it.
+	auto fixable = [&]( const uint32_t n )
+	{
+		return !b.bvhNode[n].isLeaf() && depth[n] < limit && CeilLog2( leaves[n] ) <= limit - depth[n];
+	};
+	std::vector<uint32_t> fix;
+	stack.assign( 1, 0u );
+	while (!stack.empty())
+	{
+		const uint32_t n = stack.back();
+		stack.pop_back();
+		if (depth[n] + height[n] <= limit) continue; // this subtree fits
+		const uint32_t child[2] = { b.bvhNode[n].left, b.bvhNode[n].right };
+		bool deeper = true;
+		for (uint32_t k = 0; k < 2; k++)
+			if (depth[child[k]] + height[child[k]] > limit && !fixable( child[k] )) deeper = false;
+		if (!deeper) { fix.push_back( n ); continue; }
+		for (uint32_t k = 0; k < 2; k++) if (depth[child[k]] + height[child[k]] > limit) stack.push_back( child[k] );
+	}
+	std::vector<uint32_t> leaf, pool;
+	for (const uint32_t R : fix)
+	{
+		leaf.clear(), pool.clear(), stack.assign( 1, R );
+		while (!stack.empty())
+		{
+			const uint32_t n = stack.back();
+			stack.pop_back();
+			const Node& node = b.bvhNode[n];
+			if (node.isLeaf()) { leaf.push_back( n ), st.refCount[n] = node.triCount, st.height[n] = 0; continue; }
+			pool.push_back( n ), stack.push_back( node.right ), stack.push_back( node.left );
+		}
+		uint32_t slotPtr = 0, seed = st.seed + R * 2654435761u + 3u;
+		float interior = 0;
+		OptExBuildTopology( leaf.data(), (uint32_t)leaf.size(), pool.data(), slotPtr, b.bvhNode[R].parent,
+			0, seed, interior, st, limit - depth[R] );
+	}
+	return (uint32_t)fix.size();
+}
+
+uint32_t Optimizer::KeepDepth( State& st, const char* after )
+{
+	const uint32_t rebuilt = EnforceDepth( st );
+	if (rebuilt && s.verbose) printf( "  depth limit %u: %u subtree%s rebuilt after %s\n", s.maxDepth,
+		rebuilt, rebuilt == 1 ? "" : "s", after ), fflush( stdout );
+	return rebuilt;
 }
 
 // OptExSweepSplit: exact SAH sweep over all three axes for a set of child nodes, partitioned
 // in place. 'jitter' scales each axis' score by a hashed factor: the candidate set stays the
 // same and the decision stays cost-driven, so repeated attempts sample a plateau rather than
-// drift off it. jitter 0 is the plain greedy choice.
-uint32_t Optimizer::OptExSweepSplit( uint32_t* leaf, const uint32_t count,
+// drift off it. jitter 0 is the plain greedy choice. Only splits that put kLo..kHi nodes on the
+// left are considered, which is how a depth budget reaches the sweep.
+uint32_t Optimizer::OptExSweepSplit( uint32_t* leaf, const uint32_t count, const uint32_t kLo, const uint32_t kHi,
 	const float jitter, uint32_t& seed, State& st )
 {
 	Node* nodes = b.bvhNode;
@@ -371,19 +509,22 @@ uint32_t Optimizer::OptExSweepSplit( uint32_t* leaf, const uint32_t count,
 		{
 			bmin = tinybvh::tinybvh_min( bmin, nodes[leaf[i]].aabbMin ), bmax = tinybvh::tinybvh_max( bmax, nodes[leaf[i]].aabbMax );
 			n += st.refCount[leaf[i]], own += st.ownArea[leaf[i]];
-			st.workF[i] = EffArea( bmin, bmax, own, st ), st.workI[i] = n, st.workO[i] = own;
+			if (i >= kLo && i <= kHi) st.workF[i] = EffArea( bmin, bmax, own, st ), st.workI[i] = n, st.workO[i] = own;
 		}
 		bmin = bvhvec3( BVH_FAR ), bmax = bvhvec3( -BVH_FAR ), n = 0, own = 0;
 		float axisBest = BVH_FAR;
-		uint32_t axisK = 1;
+		uint32_t axisK = 0;
 		for (uint32_t i = 0; i < count - 1; i++)
 		{
 			bmin = tinybvh::tinybvh_min( bmin, nodes[leaf[i]].aabbMin ), bmax = tinybvh::tinybvh_max( bmax, nodes[leaf[i]].aabbMax );
 			n += st.refCount[leaf[i]], own += st.ownArea[leaf[i]];
-			const float score = EffArea( bmin, bmax, own, st ) * (float)n + st.workF[i + 1] * (float)st.workI[i + 1];
-			if (score < axisBest) axisBest = score, axisK = i + 1;
+			const uint32_t k = i + 1;
+			if (k < kLo || k > kHi) continue;
+			const float score = EffArea( bmin, bmax, own, st ) * (float)n + st.workF[k] * (float)st.workI[k];
+			if (score < axisBest) axisBest = score, axisK = k;
 		}
 		if (jitter > 0) axisBest *= float( 1 ) + jitter * tinybvh::tinybvh_rndfloat( seed );
+		if (axisK == 0) continue; // no usable split along this axis
 		if (axisBest < bestScore) bestScore = axisBest, bestAxis = axis, bestK = axisK;
 	}
 	if (bestAxis == 3) return count / 2; // all candidates coincide; fall back to a median split
@@ -398,23 +539,36 @@ uint32_t Optimizer::OptExSweepSplit( uint32_t* leaf, const uint32_t count,
 
 // OptExBuildTopology: build a subtree over 'count' existing nodes, consuming interior node
 // slots from 'slots'. Returns the subtree root and accumulates the interior cost it creates;
-// the leaves' own cost is invariant, so that accumulator is all a comparison needs.
+// the leaves' own cost is invariant, so that accumulator is all a comparison needs. The subtree
+// is at most 'budget' levels tall, root to input node. A side of n nodes needs ceil(log2 n)
+// levels, so neither side may hold more than 2^(budget-1) of them, and that window is all the
+// sweep has to be told. The recursion is as deep as the subtree is tall and no deeper. A budget
+// too small for 'count' is raised to what a balanced tree needs; EnforceDepth answers for that.
 uint32_t Optimizer::OptExBuildTopology( uint32_t* leaf, const uint32_t count,
 	uint32_t* slots, uint32_t& slotPtr, const uint32_t parent, const float jitter, uint32_t& seed,
-	float& interiorCost, State& st )
+	float& interiorCost, State& st, const uint32_t budget )
 {
 	if (count == 1) { b.bvhNode[leaf[0]].parent = parent; return leaf[0]; }
 	const uint32_t self = slots[slotPtr++];
-	uint32_t k = count == 2 ? 1 : OptExSweepSplit( leaf, count, jitter, seed, st );
-	if (k == 0 || k >= count) k = count / 2;
-	const uint32_t l = OptExBuildTopology( leaf, k, slots, slotPtr, self, jitter, seed, interiorCost, st );
-	const uint32_t r = OptExBuildTopology( leaf + k, count - k, slots, slotPtr, self, jitter, seed, interiorCost, st );
+	const uint32_t levels = tinybvh::tinybvh_max( budget, CeilLog2( count ) );
+	uint32_t kLo = 1, kHi = count - 1;
+	if (levels <= 32)
+	{
+		const uint64_t side = 1ull << (levels - 1);
+		if ((uint64_t)count > side) kLo = count - (uint32_t)side;
+		if (side < (uint64_t)kHi) kHi = (uint32_t)side;
+	}
+	uint32_t k = count == 2 ? 1 : OptExSweepSplit( leaf, count, kLo, kHi, jitter, seed, st );
+	if (k < kLo || k > kHi) k = count / 2; // within the window too: 2^levels >= count
+	const uint32_t l = OptExBuildTopology( leaf, k, slots, slotPtr, self, jitter, seed, interiorCost, st, levels - 1 );
+	const uint32_t r = OptExBuildTopology( leaf + k, count - k, slots, slotPtr, self, jitter, seed, interiorCost, st, levels - 1 );
 	Node& n = b.bvhNode[self];
 	n.left = l, n.right = r, n.triCount = 0, n.firstTri = 0, n.parent = parent;
 	n.aabbMin = tinybvh::tinybvh_min( b.bvhNode[l].aabbMin, b.bvhNode[r].aabbMin );
 	n.aabbMax = tinybvh::tinybvh_max( b.bvhNode[l].aabbMax, b.bvhNode[r].aabbMax );
 	st.refCount[self] = st.refCount[l] + st.refCount[r];
 	st.ownArea[self] = st.ownArea[l] + st.ownArea[r];
+	st.height[self] = 1 + tinybvh::tinybvh_max( st.height[l], st.height[r] );
 	interiorCost += b.c_trav * EffArea( n.aabbMin, n.aabbMax, st.ownArea[self], st );
 	return self;
 }
@@ -447,12 +601,15 @@ void Optimizer::OptExExplode( const Ref* refBox, State& st )
 			Node& lf = b.bvhNode[leaf[i]];
 			lf.aabbMin = refBox[first + i].bmin, lf.aabbMax = refBox[first + i].bmax;
 			lf.firstTri = first + i, lf.triCount = 1, lf.left = lf.right = 0;
-			st.refCount[leaf[i]] = 1;
+			st.refCount[leaf[i]] = 1, st.height[leaf[i]] = 0;
 		}
 		uint32_t slotPtr = 0;
 		uint32_t seed = st.seed + (uint32_t)n * 2654435761u;
 		float dummy = 0;
-		OptExBuildTopology( leaf, m, pool, slotPtr, node.parent, 0, seed, dummy, st );
+		// the new subtree starts at the leaf's own level; one that was too deep for it already is
+		// raised to a balanced tree, and the EnforceDepth after the explode answers for the rest.
+		const uint32_t budget = s.maxDepth > st.depth[n] ? s.maxDepth - st.depth[n] : 0;
+		OptExBuildTopology( leaf, m, pool, slotPtr, node.parent, 0, seed, dummy, st, budget );
 		tinybvh::free64( pool );
 	}
 	b.Refit( 0, true );
@@ -462,6 +619,8 @@ void Optimizer::OptExExplode( const Ref* refBox, State& st )
 // the treelet leaf with the largest surface area, then solve its optimal binary topology by
 // exact DP over all 2^maxL subsets. The current topology is one of the candidates, so the
 // result is never worse. Reuses the treelet's own interior slots: no allocation, no holes.
+// The DP tracks the height of every subset's best topology, and a result that would put a leaf
+// below the depth limit is not written back.
 bool Optimizer::OptExTreelet( const uint32_t nodeIdx, const uint32_t maxL, State& st, float T )
 {
 	Node& root = b.bvhNode[nodeIdx];
@@ -485,7 +644,7 @@ bool Optimizer::OptExTreelet( const uint32_t nodeIdx, const uint32_t maxL, State
 	if (L < 3) return false;
 	const uint32_t full = (1u << L) - 1;
 	float* cost = st.tCost;
-	uint32_t* part = st.tPart;
+	uint32_t* part = st.tPart, * hgt = st.tHgt;
 	bvhvec3* tMin = st.tMin, * tMax = st.tMax;
 	for (uint32_t S = 1; S <= full; S++)
 	{
@@ -493,26 +652,28 @@ bool Optimizer::OptExTreelet( const uint32_t nodeIdx, const uint32_t maxL, State
 		{
 			const uint32_t n = leaf[tinybvh::tinybvh_ctz( S )];
 			tMin[S] = b.bvhNode[n].aabbMin, tMax[S] = b.bvhNode[n].aabbMax;
-			st.tOwn[S] = st.ownArea[n], cost[S] = st.subCost[n];
+			st.tOwn[S] = st.ownArea[n], cost[S] = st.subCost[n], hgt[S] = st.height[n];
 			continue;
 		}
 		const uint32_t low = S & (uint32_t)(-(int32_t)S), rest = S ^ low;
 		tMin[S] = tinybvh::tinybvh_min( tMin[low], tMin[rest] ), tMax[S] = tinybvh::tinybvh_max( tMax[low], tMax[rest] );
 		st.tOwn[S] = st.tOwn[low] + st.tOwn[rest]; // members lie inside their own boxes, so this is exact
 		float best = BVH_FAR;
-		uint32_t bestP = 0;
+		uint32_t bestP = 0, bestH = 0xffffu;
 		for (uint32_t P = (S - 1) & S; P; P = (P - 1) & S)
 		{
 			if (P < (S ^ P)) continue; // each unordered partition once
 			const float c = cost[P] + cost[S ^ P];
-			if (c < best) best = c, bestP = P;
+			if (c < best) best = c, bestP = P, bestH = tinybvh::tinybvh_max( hgt[P], hgt[S ^ P] );
 		}
-		cost[S] = best + b.c_trav * EffArea( tMin[S], tMax[S], st.tOwn[S], st ), part[S] = bestP;
+		cost[S] = best + b.c_trav * EffArea( tMin[S], tMax[S], st.tOwn[S], st ), part[S] = bestP, hgt[S] = bestH + 1;
 	}
 	// Without the exact test the DP must beat the current topology on its own terms - or, while
 	// the temperature is above zero, lose to it by a small enough margin. The DP's optimum is
 	// optimal only over this treelet; letting a worse one through occasionally is how the sweep
-	// reaches arrangements that no single treelet can see from here.
+	// reaches arrangements that no single treelet can see from here. It may not take a leaf past
+	// the depth limit, though; a subtree that is too deep already may still get shallower.
+	if (st.depth[nodeIdx] + hgt[full] > s.maxDepth && hgt[full] > st.height[nodeIdx]) return false;
 	uint32_t seed = st.seed + nodeIdx * 2654435761u + 7u;
 	if (!AnnealAccept( cost[full], st.subCost[nodeIdx], T, seed )) return false;
 	// write the winning topology back, root first so it lands in 'nodeIdx'.
@@ -540,12 +701,15 @@ bool Optimizer::OptExTreelet( const uint32_t nodeIdx, const uint32_t maxL, State
 		n.aabbMin = tMin[it.set], n.aabbMax = tMax[it.set];
 		st.subCost[it.slot] = cost[it.set], st.refCount[it.slot] = 0;
 	}
-	// refCount of the rewritten interior nodes, bottom-up over the treelet only.
+	// refCount and height of the rewritten interior nodes, bottom-up over the treelet only, then
+	// the new height up the ancestry, for the treelets above this one in the same sweep.
 	for (uint32_t i = I; i-- > 0; )
 	{
 		const Node& n = b.bvhNode[interior[i]];
 		st.refCount[interior[i]] = st.refCount[n.left] + st.refCount[n.right];
+		st.height[interior[i]] = 1 + tinybvh::tinybvh_max( st.height[n.left], st.height[n.right] );
 	}
+	PropagateHeight( nodeIdx, st );
 	return true;
 }
 
@@ -581,15 +745,16 @@ bool Optimizer::OptExTreeletAgglom( const uint32_t nodeIdx, const uint32_t maxL,
 	}
 	if (L < 4) return false;	// below this the DP sweep already solves it exactly
 	// every open adds one interior node and one leaf, so there are exactly L-1 slots to fill.
-	struct Cluster { bvhvec3 bmin, bmax; float cost, own; uint32_t node; bool live; };
+	struct Cluster { bvhvec3 bmin, bmax; float cost, own; uint32_t node, height; bool live; };
 	Cluster cl[MAX_AGGLOM];
 	for (uint32_t i = 0; i < L; i++)
 	{
 		const uint32_t n = leaf[i];
 		cl[i].bmin = b.bvhNode[n].aabbMin, cl[i].bmax = b.bvhNode[n].aabbMax;
 		cl[i].cost = st.subCost[n], cl[i].own = st.ownArea[n], cl[i].node = n, cl[i].live = true;
+		cl[i].height = st.height[n];
 	}
-	struct Merge { uint32_t a, b; bvhvec3 bmin, bmax; float cost, own; };
+	struct Merge { uint32_t a, b; bvhvec3 bmin, bmax; float cost, own; uint32_t height; };
 	Merge mg[MAX_AGGLOM];
 	uint32_t merges = 0;
 	for (uint32_t live = L; live > 1; live--)
@@ -608,16 +773,20 @@ bool Optimizer::OptExTreeletAgglom( const uint32_t nodeIdx, const uint32_t maxL,
 			if (d < bestD) bestD = d, bi = i, bj = j, bestMin = mn, bestMax = mx, bestOwn = own;
 		}
 		if (bi == (uint32_t)-1) return false;	// cannot happen with live > 1, but do not write back on it
+		const uint32_t height = 1 + tinybvh::tinybvh_max( cl[bi].height, cl[bj].height );
 		Merge& m = mg[merges++];
-		m.a = cl[bi].node, m.b = cl[bj].node, m.bmin = bestMin, m.bmax = bestMax, m.own = bestOwn;
+		m.a = cl[bi].node, m.b = cl[bj].node, m.bmin = bestMin, m.bmax = bestMax, m.own = bestOwn, m.height = height;
 		m.cost = cl[bi].cost + cl[bj].cost + b.c_trav * bestD;
-		cl[bi].bmin = bestMin, cl[bi].bmax = bestMax, cl[bi].own = bestOwn, cl[bi].cost = m.cost;
+		cl[bi].bmin = bestMin, cl[bi].bmax = bestMax, cl[bi].own = bestOwn, cl[bi].cost = m.cost, cl[bi].height = height;
 		// tag the surviving cluster as "the result of merge m"; the slot it will occupy is only
 		// decided at write-back, so nothing is claimed until the whole clustering has won.
 		cl[bi].node = 0x80000000u | (merges - 1);
 		cl[bj].live = false;
 	}
 	if (merges != L - 1) return false;
+	// as for the DP: not past the depth limit, unless it is an improvement on a subtree beyond it.
+	const uint32_t newHeight = mg[merges - 1].height;
+	if (st.depth[nodeIdx] + newHeight > s.maxDepth && newHeight > st.height[nodeIdx]) return false;
 	uint32_t aseed = st.seed + nodeIdx * 2654435761u + 13u;
 	if (!AnnealAccept( mg[merges - 1].cost, st.subCost[nodeIdx], T, aseed )) return false;
 	// Write back. Merge m takes slot interior[L-2-m], so the last merge lands in nodeIdx and a
@@ -642,7 +811,9 @@ bool Optimizer::OptExTreeletAgglom( const uint32_t nodeIdx, const uint32_t maxL,
 	{
 		const Node& n = b.bvhNode[interior[i]];
 		st.refCount[interior[i]] = st.refCount[n.left] + st.refCount[n.right];
+		st.height[interior[i]] = 1 + tinybvh::tinybvh_max( st.height[n.left], st.height[n.right] );
 	}
+	PropagateHeight( nodeIdx, st );
 	return true;
 }
 
@@ -996,6 +1167,9 @@ void Optimizer::OptExRebuildSubtrees( const Settings& s, State& st, float T0 )
 			nodeIdx = stack[--stackPtr];
 		}
 		if (overflow || leafCount < 4 || poolCount != leafCount - 1) continue;
+		// the rebuild gets the levels between R and the depth limit, and no more.
+		const uint32_t budget = s.maxDepth > st.depth[R] ? s.maxDepth - st.depth[R] : 0;
+		if (budget < CeilLog2( leafCount )) continue;
 		pool[0] = R; // the root slot must stay put; the order of the others is free
 		for (uint32_t i = 1; i < poolCount; i++) if (pool[i] == R) { pool[i] = pool[0]; break; }
 		memcpy( leaf0, leaf, leafCount * sizeof( uint32_t ) );
@@ -1016,8 +1190,8 @@ void Optimizer::OptExRebuildSubtrees( const Settings& s, State& st, float T0 )
 			uint32_t seed = st.seed + (uint32_t)R * 2654435761u + attempt * 40503u + 1;
 			memcpy( leaf, leaf0, leafCount * sizeof( uint32_t ) );
 			OptExBuildTopology( leaf, leafCount, pool, slotPtr, rootParent,
-				attempt == 0 ? float( 0 ) : float( s.rebuildJitter ), seed, interior, st );
-			if (interior < best) best = interior, bestAttempt = attempt;
+				attempt == 0 ? float( 0 ) : float( s.rebuildJitter ), seed, interior, st, budget );
+			if (interior < best - TIE_EPS * best) best = interior, bestAttempt = attempt; // a tie is not a win
 			if (interior < bestAny) bestAny = interior, bestAnyAttempt = attempt;
 		}
 		if (bestAttempt == (uint32_t)-1 && bestAnyAttempt != (uint32_t)-1)
@@ -1042,7 +1216,7 @@ void Optimizer::OptExRebuildSubtrees( const Settings& s, State& st, float T0 )
 			uint32_t seed = st.seed + (uint32_t)R * 2654435761u + bestAttempt * 40503u + 1;
 			memcpy( leaf, leaf0, leafCount * sizeof( uint32_t ) );
 			OptExBuildTopology( leaf, leafCount, pool, slotPtr, rootParent,
-				bestAttempt == 0 ? float( 0 ) : float( s.rebuildJitter ), seed, interior, st );
+				bestAttempt == 0 ? float( 0 ) : float( s.rebuildJitter ), seed, interior, st, budget );
 			done++;
 		}
 	}
@@ -1332,6 +1506,7 @@ void Optimizer::OptExExactBottom( const Settings& s, State& st )
 	uint32_t* part = (uint32_t*)tinybvh::malloc64( tableSize * sizeof( uint32_t ) );
 	bvhvec3* tMin = (bvhvec3*)tinybvh::malloc64( tableSize * sizeof( bvhvec3 ) );
 	bvhvec3* tMax = (bvhvec3*)tinybvh::malloc64( tableSize * sizeof( bvhvec3 ) );
+	uint32_t* hgt = (uint32_t*)tinybvh::malloc64( tableSize * sizeof( uint32_t ) );
 	uint32_t leaf0[MAX_EXACT], pool[MAX_EXACT], prims[MAX_EXACT], tmpPrim[MAX_EXACT];
 	uint32_t stack[STACK_SIZE], stackPtr = 0, nodeIdx = 0;
 	while (1)
@@ -1380,25 +1555,30 @@ void Optimizer::OptExExactBottom( const Settings& s, State& st )
 					{
 						const uint32_t n = leaf0[tinybvh::tinybvh_ctz( S )];
 						tMin[S] = b.bvhNode[n].aabbMin, tMax[S] = b.bvhNode[n].aabbMax;
-						cost[S] = b.c_int * SurfaceArea( tMin[S], tMax[S] ), part[S] = 0; // a single reference is a leaf
+						cost[S] = b.c_int * SurfaceArea( tMin[S], tMax[S] ), part[S] = 0, hgt[S] = 0; // a single reference is a leaf
 						continue;
 					}
 					const uint32_t low = S & (uint32_t)(-(int32_t)S), rest = S ^ low;
 					tMin[S] = tinybvh::tinybvh_min( tMin[low], tMin[rest] ), tMax[S] = tinybvh::tinybvh_max( tMax[low], tMax[rest] );
 					const float area = SurfaceArea( tMin[S], tMax[S] );
 					float best = BVH_FAR;
-					uint32_t bestP = 0;
+					uint32_t bestP = 0, bestH = 0xffffu;
 					for (uint32_t P = (S - 1) & S; P; P = (P - 1) & S)
 					{
 						if (P < (S ^ P)) continue; // each unordered partition once
 						const float c = cost[P] + cost[S ^ P];
-						if (c < best) best = c, bestP = P;
+						if (c < best) best = c, bestP = P, bestH = tinybvh::tinybvh_max( hgt[P], hgt[S ^ P] );
 					}
 					const float asLeaf = bits <= s.maxLeafPrims ? b.c_int * area * (float)bits : BVH_FAR;
 					const float asSplit = b.c_trav * area + best;
-					if (asLeaf <= asSplit) cost[S] = asLeaf, part[S] = 0; else cost[S] = asSplit, part[S] = bestP;
+					// a leaf is shallower than any split of the same references, so it takes the ties.
+					if (asLeaf <= asSplit + TIE_EPS * asSplit) cost[S] = asLeaf, part[S] = 0, hgt[S] = 0;
+					else cost[S] = asSplit, part[S] = bestP, hgt[S] = bestH + 1;
 				}
-				if (cost[full] < current)
+				// a real improvement only, and one that keeps its leaves above the depth limit or at
+				// least no deeper than the subtree it replaces.
+				const bool fits = st.depth[R] + hgt[full] <= s.maxDepth || hgt[full] <= st.height[R];
+				if (cost[full] < current - TIE_EPS * current && fits)
 				{
 					// write the optimal tree back. Leaves get contiguous slices of the same
 					// b.primIdx range, in whatever order the walk emits them; the compaction that
@@ -1465,7 +1645,7 @@ void Optimizer::OptExExactBottom( const Settings& s, State& st )
 		if (stackPtr == 0) break;
 		nodeIdx = stack[--stackPtr];
 	}
-	tinybvh::free64( tMax ), tinybvh::free64( tMin ), tinybvh::free64( part ), tinybvh::free64( cost );
+	tinybvh::free64( hgt ), tinybvh::free64( tMax ), tinybvh::free64( tMin ), tinybvh::free64( part ), tinybvh::free64( cost );
 }
 
 void Optimizer::Run( Ref* refBox, const uint32_t* vertIdx )
@@ -1496,6 +1676,10 @@ void Optimizer::Run( Ref* refBox, const uint32_t* vertIdx )
 	st.tPart = (uint32_t*)tinybvh::malloc64( (1u << MAX_TREELET) * sizeof( uint32_t ) );
 	st.tMin = (bvhvec3*)tinybvh::malloc64( (1u << MAX_TREELET) * sizeof( bvhvec3 ) );
 	st.tMax = (bvhvec3*)tinybvh::malloc64( (1u << MAX_TREELET) * sizeof( bvhvec3 ) );
+	st.height = (uint32_t*)tinybvh::malloc64( b.allocatedNodes * sizeof( uint32_t ) );
+	st.depth = (uint32_t*)tinybvh::malloc64( b.allocatedNodes * sizeof( uint32_t ) );
+	st.tHgt = (uint32_t*)tinybvh::malloc64( (1u << MAX_TREELET) * sizeof( uint32_t ) );
+	s.maxDepth = (uint32_t)tinybvh::tinybvh_clamp( (int32_t)s.maxDepth, 16, (int32_t)MAX_DEPTH );
 	st.orderCount = 0, st.seed = s.seed ? s.seed : 1u;
 	// BVH::Save writes settings into the file and Load restores them, so a BVH saved with
 	// threading disabled would run the library's parallel optimizer on the calling thread.
@@ -1534,9 +1718,11 @@ void Optimizer::Run( Ref* refBox, const uint32_t* vertIdx )
 		scratchNode = (Node*)tinybvh::malloc64( b.allocatedNodes * sizeof( Node ) );
 		scratchPrim = (uint32_t*)tinybvh::malloc64( maxRefsForSnapshot * sizeof( uint32_t ) );
 	}
-	// stage 0: one reference per leaf. This raises SAHCost; stage 5 takes it back.
+	// stage 0: one reference per leaf. This raises SAHCost; stage 5 takes it back. A tree that was
+	// handed in is held to the depth limit first, since every walk below needs it to be.
+	KeepDepth( st, "loading" );
 	OptExComputeCosts( st );
-	if (s.explodeLeaves) OptExExplode( refBox, st );
+	if (s.explodeLeaves) OptExExplode( refBox, st ), KeepDepth( st, "exploding the leaves" );
 	RefreshOwnArea( st );
 	OptExComputeCosts( st );
 	float cost = b.SAHCost(), sahPart = 0;
@@ -1572,6 +1758,7 @@ void Optimizer::Run( Ref* refBox, const uint32_t* vertIdx )
 			if (s.fast) b.Optimize( s.reinsertIters, s.fastMu );
 			else OptimizeSerial( s.reinsertIters, true, stochastic, st.seed,
 				s.anneal > 0 ? s.anneal * b.bvhNode[0].SA() : 0.0f );
+			KeepDepth( st, "reinsertion" ); // the one stage that cannot respect the limit as it goes
 			Progress( round, roundStart, "reinsertion" ); // stage 1
 		}
 		// One temperature for every descent in the round, in the objective's own units. Each pass
@@ -1583,6 +1770,7 @@ void Optimizer::Run( Ref* refBox, const uint32_t* vertIdx )
 			Progress( round, roundStart, "treelets" ); // stage 2
 		if (s.rebuildSubtrees) OptExRebuildSubtrees( s, st, T0 ), Progress( round, roundStart, "subtree rebuild" ); // stage 3
 		if (s.unsplitRefs) { OptExUnsplit( st ); OptExCompactRefs(); Progress( round, roundStart, "unsplitting" ); } // stage 4
+		KeepDepth( st, "the round" ); // stages 2-4 respect the limit themselves; this only checks
 		if (gate)
 		{
 			const Clock::time_point g0 = Clock::now();
@@ -1627,6 +1815,7 @@ void Optimizer::Run( Ref* refBox, const uint32_t* vertIdx )
 		const Clock::time_point t0 = Clock::now();
 		OptExExactBottom( s, st ); // stage 5a: optimal bottoms, topology and leaves decided together
 		if (holes) { b.Compact(), holes = false; }
+		KeepDepth( st, "exact bottoms" );
 		OptExCompactRefs();
 		Progress( (uint32_t)-1, t0, "exact bottoms" );
 	}
@@ -1635,10 +1824,14 @@ void Optimizer::Run( Ref* refBox, const uint32_t* vertIdx )
 	OptExCompactRefs();
 	Progress( (uint32_t)-1, tc, "leaf collapse" );
 	if (holes) { b.Compact(), holes = false; }
+	// the guarantee the output is written under. A rebuild here reorders references within the
+	// subtrees it touched, so the depth-first order the leaf passes downstream rely on is restored.
+	if (KeepDepth( st, "the final collapse" )) OptExCompactRefs();
 	if (scratchPrim) tinybvh::free64( scratchPrim );
 	if (scratchNode) tinybvh::free64( scratchNode );
 	if (snapPrim) tinybvh::free64( snapPrim );
 	if (snapNode) tinybvh::free64( snapNode );
+	tinybvh::free64( st.tHgt ), tinybvh::free64( st.depth ), tinybvh::free64( st.height );
 	tinybvh::free64( st.tOwn ), tinybvh::free64( st.ownArea );
 	tinybvh::free64( st.tMax ), tinybvh::free64( st.tMin ), tinybvh::free64( st.tPart ), tinybvh::free64( st.tCost );
 	tinybvh::free64( st.workO ), tinybvh::free64( st.workI ), tinybvh::free64( st.workF ), tinybvh::free64( st.work );
@@ -1871,6 +2064,26 @@ template <typename F> static void ForEachSampleRay( const tinybvh::BVH& bvh, uin
 		const int32_t cost2 = bvh.Intersect( bounce );
 		fn( p, d2, bounce.hit.t, cost2 );
 	}
+}
+
+// TreeDepth: the deepest leaf below the root, which is the most stack a binary walk of the tree
+// needs. Unlike BVH::Depth it keeps its own stack on the heap, so it can measure a tree that is
+// too deep for the library to walk - which is the one tree worth measuring.
+static uint32_t TreeDepth( const tinybvh::BVH& bvh )
+{
+	if (bvh.usedNodes == 0 || bvh.bvhNode[0].isLeaf()) return 0;
+	std::vector<std::pair<uint32_t, uint32_t>> stack( 1, std::make_pair( 0u, 0u ) );
+	uint32_t deepest = 0;
+	while (!stack.empty())
+	{
+		const uint32_t n = stack.back().first, d = stack.back().second;
+		stack.pop_back();
+		const tinybvh::BVH::BVHNode& node = bvh.bvhNode[n];
+		if (node.isLeaf()) { deepest = tinybvh::tinybvh_max( deepest, d ); continue; }
+		stack.push_back( std::make_pair( (uint32_t)node.leftFirst, d + 1 ) );
+		stack.push_back( std::make_pair( (uint32_t)node.leftFirst + 1, d + 1 ) );
+	}
+	return deepest;
 }
 
 static double MeasureTraversal( const tinybvh::BVH& bvh, uint32_t count, uint32_t seed )
@@ -2257,50 +2470,58 @@ static void CountBinarySteps( const tinybvh::BVH& b, const RaySet& rays, const b
 // has to be run first, and whether they have a file format of their own. The CPU layouts
 // collapse from the binary tree themselves; the four GPU layouts take an MBVH that is
 // already collapsed. WideBuild returns the MBVH the result was encoded from, which is what
-// gets measured.
+// gets measured. ConvertFrom runs with the settings of the instance it is called on, and every
+// MBVH and layout made here is fresh, so each takes the source tree's first: that is how a
+// candidate built serially stays serial through its collapse and encoding.
 // ----------------------------------------------------------------------------------------
 
 static const tinybvh::MBVH<4>* WideBuild( tinybvh::BVH4_CPU& o, tinybvh::MBVH<4>& m )
 {
+	o.settings = o.bvh4.settings = m.bvh.settings;
 	o.bvh4.bvh.ReferenceFrom( m.bvh ), o.bvh4.ownBVH = false, o.bvh4.nodeProb = m.nodeProb;
-	o.ConvertFrom( o.bvh4, true );	// leaves were merged by the optimizer's collapse
+	o.ConvertFrom( o.bvh4 );	// splits leaves over four prims only; the collapse groups the rest
 	return &o.bvh4;
 }
 
 static const tinybvh::MBVH<8>* WideBuild( tinybvh::BVH8_CPU& o, tinybvh::MBVH<8>& m )
 {
+	o.settings = o.bvh8.settings = m.bvh.settings;
 	o.bvh8.bvh.ReferenceFrom( m.bvh ), o.bvh8.ownBVH = false, o.bvh8.nodeProb = m.nodeProb;
-	o.ConvertFrom( o.bvh8, true );
+	o.ConvertFrom( o.bvh8 );
 	return &o.bvh8;
 }
 
 static const tinybvh::MBVH<4>* WideBuild( tinybvh::BVH4_GPU& o, tinybvh::MBVH<4>& m )
 {
+	m.settings = o.settings = m.bvh.settings;
 	m.ConvertFrom( m.bvh, true ), o.ConvertFrom( m, true );
 	return &m;
 }
 
 static const tinybvh::MBVH<8>* WideBuild( tinybvh::BVH8_CWBVH& o, tinybvh::MBVH<8>& m )
 {
+	m.settings = o.settings = m.bvh.settings;
 	m.ConvertFrom( m.bvh, true ), o.ConvertFrom( m, true );
 	return &m;
 }
 
 static const tinybvh::MBVH<4>* WideBuild( tinybvh::BVH4_AMD_HW& o, tinybvh::MBVH<4>& m )
 {
+	m.settings = o.settings = m.bvh.settings;
 	m.ConvertFrom( m.bvh, true ), o.ConvertFrom( m );
 	return &m;
 }
 
 static const tinybvh::MBVH<8>* WideBuild( tinybvh::CWBVH8_AMD_HW& o, tinybvh::MBVH<8>& m )
 {
+	m.settings = o.settings = m.bvh.settings;
 	m.ConvertFrom( m.bvh, true ), o.ConvertFrom( m, true );
 	return &m;
 }
 
 // Wall clock, best of a few runs: the differences between these trees are small enough that
-// a single timed pass mostly measures the machine. The hardware formats have no traversal
-// kernel on the CPU, so they report no time at all rather than a misleading one.
+// a single timed pass mostly measures the machine. The CPU traversal of the hardware formats
+// is for validation only, so they report no time at all rather than a misleading one.
 template <typename T> static double WideTime( const T& tree, const RaySet& rays, const uint32_t runs )
 {
 	double best = 1e30;
@@ -2348,7 +2569,7 @@ struct TargetInfo
 	const char* name;
 	uint32_t leafPrims;		// primitives per leaf this layout is built for; 0: no cap, SAH decides
 	uint32_t collapseLimit;	// leafPrimLimit for the collapse; 0 means it may not merge leaves
-	bool fitLeaves;			// FitLeafs rather than SplitLeafs, as the layout's own Load does
+	bool fitLeaves;			// FitLeafs rather than SplitLeafs; as the layout's own Build and Load do
 	bool quadLeaves;		// leaf of four tested as one unit, so a partial leaf costs a full quad
 };
 
@@ -2359,7 +2580,7 @@ static const TargetInfo g_target[TGT_COUNT] =
 	{ "bvh4cpu",     4, 4, false, true  },
 	{ "bvh8cpu",     4, 4, false, true  },
 	{ "bvh4gpu",     4, 0, false, true  },
-	{ "bvh8cwbvh",   3, 3, true,  false },
+	{ "bvh8cwbvh",   3, 3, false, false },	// SplitLeafs( 3 ), as BVH8_CWBVH::Build and Load
 	{ "bvh4amdhw",   1, 0, false, false },
 	{ "cwbvh8amdhw", 2, 2, false, false }
 };
@@ -2396,6 +2617,7 @@ template <typename T, int M> struct WideGate : public RoundGate
 	const char* Unit() const override { return useTime ? "measured traversal time" : "measured traversal work"; }
 	double Score( const tinybvh::BVH_Verbose& tree ) const override
 	{
+		work.settings = tree.settings; // ConvertFrom keeps an instance's own
 		work.ConvertFrom( tree );
 		if (info->leafPrims) { if (info->fitLeaves) work.FitLeafs( info->leafPrims ); else work.SplitLeafs( info->leafPrims ); }
 		tinybvh::MBVH<M> m;
@@ -2422,6 +2644,7 @@ struct BinaryGate : public RoundGate
 	const char* Unit() const override { return useTime ? "measured traversal time" : "measured traversal work"; }
 	double Score( const tinybvh::BVH_Verbose& tree ) const override
 	{
+		work.settings = tree.settings; // ConvertFrom keeps an instance's own
 		work.ConvertFrom( tree );
 		double box, prim, nodes;
 		CountBinarySteps( work, *rays, rootTest, box, prim, nodes );
@@ -2851,6 +3074,7 @@ template <typename T, int M> static CostFit FitWideCostModel( const std::vector<
 	uint32_t buckets = 0;
 	{
 		tinybvh::BVH ref;
+		ref.settings.bonsaiTopTree = tinybvh::BONSAI_TOP_CHEAPEST; // as for every Bonsai this tool builds
 		ref.Build( tris.data(), (uint32_t)tris.size() / 3 );
 		buckets = SplitRaysByWork( ref, rays, bucket, CAL_BUCKETS, CAL_MIN_RAYS );
 	}
@@ -2911,6 +3135,7 @@ static CostFit FitBinaryCostModel( const std::vector<bvhvec4>& tris, const bool 
 	uint32_t buckets = 0;
 	{
 		tinybvh::BVH ref;
+		ref.settings.bonsaiTopTree = tinybvh::BONSAI_TOP_CHEAPEST; // as for every Bonsai this tool builds
 		ref.Build( tris.data(), (uint32_t)tris.size() / 3 );
 		buckets = SplitRaysByWork( ref, rays, bucket, CAL_BUCKETS, CAL_MIN_RAYS );
 	}
@@ -2931,6 +3156,7 @@ static CostFit FitBinaryCostModel( const std::vector<bvhvec4>& tris, const bool 
 		if (gpuLayout)
 		{
 			if (!FitsGPULayout( cal[ti] )) { CostFit f; f.why = "a calibration tree does not fit the layout"; return f; }
+			gpu[ti].settings = cal[ti].settings;
 			gpu[ti].ConvertFrom( cal[ti], true );
 		}
 		mb[ti] = (double)(cal[ti].usedNodes * sizeof( tinybvh::BVH::BVHNode )
@@ -3157,7 +3383,10 @@ struct Replacement
 };
 
 // Copy a replacement's subtree into the new node list, clipping every box to the box of the node
-// it replaces, which only shrinks them and keeps the root box exactly equal to the original's.
+// it replaces, which only shrinks them and keeps the root box exactly equal to the original's. A
+// rebuilt node can lie wholly outside that box on some axis, and a ray that reaches it through its
+// ancestors cannot hit anything there; its clip is empty, and becomes a point in the box, of zero
+// area, as ClippedArea counts it. Left inverted, its area would be negative.
 static void EmitReplacement( const Replacement& r, const uint32_t src, const uint32_t dst,
 	const bvhvec3& lo, const bvhvec3& hi, std::vector<tinybvh::BVH::BVHNode>& node, std::vector<uint32_t>& prim )
 {
@@ -3170,6 +3399,8 @@ static void EmitReplacement( const Replacement& r, const uint32_t src, const uin
 		const tinybvh::BVH::BVHNode& in = r.tree.bvhNode[s];
 		tinybvh::BVH::BVHNode& out = node[d];
 		out.aabbMin = tinybvh_max( in.aabbMin, lo ), out.aabbMax = tinybvh_min( in.aabbMax, hi );
+		const bvhvec3 e = out.aabbMax - out.aabbMin;
+		if (e.x < 0 || e.y < 0 || e.z < 0) out.aabbMax = out.aabbMin = tinybvh_min( out.aabbMin, hi );
 		if (in.isLeaf())
 		{
 			out.leftFirst = (uint32_t)prim.size(), out.triCount = in.triCount;
@@ -3538,6 +3769,7 @@ struct CandidateStats
 {
 	float sahPre, epoPre, sahPost, epoPost;
 	uint32_t rung;			// the profile rung whose tree was kept; see the ladder in PrepareCandidate
+	uint32_t depth;			// deepest leaf of the finished binary tree
 	double seconds;			// build plus optimize, without the measurements themselves
 };
 
@@ -3579,6 +3811,10 @@ static void PrepareCandidate( tinybvh::BVH& bvh, const std::vector<bvhvec4>& tri
 	bvh.settings.binnedBVH = cand.binned;		// SBVH with, Bonsai HQ without
 	bvh.hqbvhbins = cand.bins, bvh.hqbvhoddeven = cand.oddEven;
 	bvh.settings.bonsaiPruneFactor = cand.prune;
+	// for a Bonsai candidate: the best of three top trees, which the library leaves off by default for
+	// its build time. Under -metric raycost the gate picks it, below; otherwise the library does, by
+	// SAH. The baseline below stays a stock build, as every improvement is quoted against it.
+	bvh.settings.bonsaiTopTree = tinybvh::BONSAI_TOP_CHEAPEST;
 	bvh.hqLeafPrims = capped ? info.leafPrims : 0, bvh.lQuads = info.quadLeaves;
 	bvh.c_trav = cTrav, bvh.c_int = cInt;
 	// One candidate per thread means the work inside one has to stay on its own thread: the
@@ -3591,19 +3827,48 @@ static void PrepareCandidate( tinybvh::BVH& bvh, const std::vector<bvhvec4>& tri
 	// they recover them exactly. Which is only worth doing if the optimizer is going to take the
 	// leaves apart anyway; with -noexplode it works with the ones the builder produced.
 	bvh.settings.keepSplitting = set.explodeLeaves;
-	if (filter.active())
+	auto build = [&]()
 	{
-		// Build over the kept triangles only, as an indexed mesh. The tree stays indexed for the
-		// whole of the optimizer: its primitive indices are then positions in the kept list, which
-		// is what the builder's own fragment array is sized for, and triangle lookups go through
-		// vertIdx and land on the right vertices. Unindexing happens at the end, once nothing is
-		// reading those arrays any more - see the bottom of this function.
-		bvh.Build( tinybvh::bvhvec4slice( tris.data(), (uint32_t)tris.size(), sizeof( bvhvec4 ) ),
-			filter.vertIdx.data(), (uint32_t)filter.keep.size() );
+		if (filter.active())
+		{
+			// Build over the kept triangles only, as an indexed mesh. The tree stays indexed for the
+			// whole of the optimizer: its primitive indices are then positions in the kept list, which
+			// is what the builder's own fragment array is sized for, and triangle lookups go through
+			// vertIdx and land on the right vertices. Unindexing happens at the end, once nothing is
+			// reading those arrays any more - see the bottom of this function.
+			bvh.Build( tinybvh::bvhvec4slice( tris.data(), (uint32_t)tris.size(), sizeof( bvhvec4 ) ),
+				filter.vertIdx.data(), (uint32_t)filter.keep.size() );
+		}
+		else bvh.Build( tris.data(), (uint32_t)tris.size() / 3 );
+		// Before anything else touches the tree: see RebuildSubtrees.
+		if (pre.on) RebuildSubtrees( bvh, pre );
+	};
+	if (!cand.binned && metric == METRIC_RAYCOST && gate)
+	{
+		// A Bonsai's top tree, by ray cost: the tree from each top builder, as built, is scored by the
+		// gate, and the cheapest is the one the optimizer starts from. SAH, the library's own pick,
+		// misjudged it on some scenes. Rebuilding the winner gives the same tree again.
+		static const uint32_t topTree[3] = { tinybvh::BONSAI_TOP_BINNED, tinybvh::BONSAI_TOP_FULLSWEEP, tinybvh::BONSAI_TOP_HPLOC };
+		static const char* topName[3] = { "binned", "full sweep", "H-PLOC" };
+		double bestCost = BVH_FAR, cost[3];
+		uint32_t pick = 0;
+		for (uint32_t k = 0; k < 3; k++)
+		{
+			bvh.settings.bonsaiTopTree = topTree[k];
+			build();
+			tinybvh::BVH_Verbose verbose;
+			verbose.settings = bvh.settings;
+			verbose.ConvertFrom( bvh );
+			verbose.c_trav = bvh.c_trav, verbose.c_int = bvh.c_int, verbose.lQuads = bvh.lQuads;
+			cost[k] = gate->Score( verbose );
+			if (cost[k] < bestCost) bestCost = cost[k], pick = k;
+		}
+		if (set.verbose) printf( "  %-10s top tree by ray cost: binned %.4f, full sweep %.4f, H-PLOC %.4f: %s\n",
+			CandidateName( candidate ), cost[0], cost[1], cost[2], topName[pick] );
+		bvh.settings.bonsaiTopTree = topTree[pick];
+		if (pick != 2) build(); // the last one built is still in place
 	}
-	else bvh.Build( tris.data(), (uint32_t)tris.size() / 3 );
-	// Before anything else touches the tree: see RebuildSubtrees.
-	if (pre.on) RebuildSubtrees( bvh, pre );
+	else build();
 	st.seconds = MilliSec( t0, Clock::now() ) / 1000.0;
 	st.sahPre = bvh.SAHCost(), st.epoPre = bvh.EPOCost();
 	const Clock::time_point t1 = Clock::now();
@@ -3664,10 +3929,12 @@ static void PrepareCandidate( tinybvh::BVH& bvh, const std::vector<bvhvec4>& tri
 		float score = BVH_FAR;
 		{
 			tinybvh::BVH_Verbose verbose;
+			// ConvertFrom copies flags, not settings or costs. Without the settings a candidate
+			// built serially would optimize and be gated on the thread pool; without the costs the
+			// optimizer would spend its whole run minimizing a different SAH than the one the
+			// builder used and the one the result is judged by.
+			verbose.settings = bvh.settings;
 			verbose.ConvertFrom( bvh );
-			// ConvertFrom copies flags, not costs, so without this the optimizer spends its whole
-			// run minimizing a different SAH than the one the builder used and the one the result
-			// is judged by.
 			verbose.c_trav = bvh.c_trav, verbose.c_int = bvh.c_int, verbose.lQuads = bvh.lQuads;
 			Optimizer opt( verbose, rung );
 			opt.SetGate( gate );
@@ -3700,6 +3967,10 @@ static void PrepareCandidate( tinybvh::BVH& bvh, const std::vector<bvhvec4>& tri
 	if (capped) { if (info.fitLeaves) bvh.FitLeafs( info.leafPrims ); else bvh.SplitLeafs( info.leafPrims ); }
 	st.seconds += MilliSec( t1, Clock::now() ) / 1000.0;
 	st.sahPost = bvh.SAHCost(), st.epoPost = bvh.EPOCost();
+	// The optimizer guarantees this, and everything after here only collapses or relabels; a tree
+	// the traversal kernels cannot walk is not an output, whatever its cost.
+	st.depth = TreeDepth( bvh );
+	BVH_FATAL_ERROR_IF( st.depth > set.maxDepth, "bvhopt: optimized tree is deeper than -maxdepth allows." );
 	if (filter.active())
 	{
 		// Unindex: map each primitive index from a position in the kept list to the triangle id it
@@ -3811,6 +4082,7 @@ static void EvaluateGPUTarget( const TargetInfo& info, tinybvh::BVH* bvh, const 
 		CountBinarySteps( bvh[c], score, false, box, prim, nodes );
 		const double cost = nodes * bvh[c].c_trav + prim * bvh[c].c_int;
 		tinybvh::BVH_GPU tree;
+		tree.settings = bvh[c].settings;
 		tree.ConvertFrom( bvh[c], true );
 		const double ns = WideTime( tree, score, w.timingRuns );
 		// nodes plus the ordered triangles, which this layout allocates and owns.
@@ -4014,6 +4286,7 @@ static int RunWideTargets( const std::string& meshPath, const Optimizer::Setting
 		// throwaway tree instead: the distribution is a property of where the geometry is and
 		// what it occludes, not of how it happens to be organized, so the sets are the same.
 		tinybvh::BVH seed;
+		seed.settings.bonsaiTopTree = tinybvh::BONSAI_TOP_CHEAPEST; // as for every Bonsai this tool builds
 		seed.Build( tris.data(), (uint32_t)tris.size() / 3 );
 		GenerateRays( seed, w.rays, set.seed ^ 0x9E3779B9u, fit );
 		GenerateRays( seed, w.rays, set.seed ^ 0x85EBCA6Bu, score );
@@ -4144,11 +4417,11 @@ static int RunWideTargets( const std::string& meshPath, const Optimizer::Setting
 				w.profile, useMetric, workers > 1, w.noSplits, w.effort );
 			const uint32_t done = ++finished;
 			std::lock_guard<std::mutex> lock( report );
-			if (workers > 1) printf( "  [%2u/%2u] %-10s %u refs, %u nodes, SAH %.4f, EPO %.4f, rung %s, %.1f s\n",
-				done, w.candidates, CandidateName( c ), bvh[c].idxCount, bvh[c].usedNodes,
+			if (workers > 1) printf( "  [%2u/%2u] %-10s %u refs, %u nodes, depth %u, SAH %.4f, EPO %.4f, rung %s, %.1f s\n",
+				done, w.candidates, CandidateName( c ), bvh[c].idxCount, bvh[c].usedNodes, stat[c].depth,
 				stat[c].sahPost, stat[c].epoPost, g_profileName[stat[c].rung], stat[c].seconds );
-			else printf( "  %-10s %u references, %u nodes, SAH %.4f, EPO %.4f, %.1f s\n", CandidateName( c ),
-				bvh[c].idxCount, bvh[c].usedNodes, stat[c].sahPost, stat[c].epoPost, stat[c].seconds );
+			else printf( "  %-10s %u references, %u nodes, depth %u, SAH %.4f, EPO %.4f, %.1f s\n", CandidateName( c ),
+				bvh[c].idxCount, bvh[c].usedNodes, stat[c].depth, stat[c].sahPost, stat[c].epoPost, stat[c].seconds );
 			fflush( stdout );
 		};
 		if (workers > 1)
@@ -4283,6 +4556,9 @@ static void Usage( const bool advanced )
 		"  -fastmu N          its search density, higher is sparser and quicker (default 8)\n"
 		"  -exact N           exact optimal subtrees up to N references, 0 disables (default 10, max 14)\n"
 		"  -leaf N            final leaf budget: 1 for a pure BVH2, 4 for BVH4_CPU (default 4)\n"
+		"  -maxdepth N        no leaf deeper than N below the root (default and maximum: the library's\n"
+		"                     traversal stack, TINYBVH_STACK_SIZE; at least 16). Lower it for kernels\n"
+		"                     with a smaller stack\n"
 		"  -epoguide W        steer decisions by estimated EPO, weight W (default 0.5, 0 = off)\n"
 		"  -epores N          density field resolution per axis (default 128)\n"
 		"  -epogate           evaluate EPO every round and undo a round that did not pay\n"
@@ -4349,6 +4625,7 @@ int main( int argc, char** argv )
 		else if (a == "-rebuild") set.rebuildSubtrees = num( 0 ), wide.effort.rebuild = true;
 		else if (a == "-exact") set.exactBottomSize = num( 10 ), wide.effort.exact = true;
 		else if (a == "-leaf") set.maxLeafPrims = num( 4 );
+		else if (a == "-maxdepth") set.maxDepth = num( MAX_DEPTH );
 		else if (a == "-seed") set.seed = num( 0x12345678u );
 		else if (a == "-epogate") set.epoGate = true;
 		else if (a == "-epoguide") set.epoGuide = i + 1 < argc ? (float)atof( argv[++i] ) : 1.0f;
@@ -4446,6 +4723,7 @@ int main( int argc, char** argv )
 	set.treeletSize = (uint32_t)tinybvh::tinybvh_clamp( (int32_t)set.treeletSize, 3, (int32_t)MAX_TREELET );
 	set.treeletSizeTop = (uint32_t)tinybvh::tinybvh_clamp( (int32_t)set.treeletSizeTop, (int32_t)set.treeletSize, (int32_t)MAX_TREELET );
 	if (set.exactBottomSize > MAX_EXACT) set.exactBottomSize = MAX_EXACT;
+	set.maxDepth = (uint32_t)tinybvh::tinybvh_clamp( (int32_t)set.maxDepth, 16, (int32_t)MAX_DEPTH );
 	if (!wide.weighted && !wide.plain) { printf( "error: -noweight and -noplain leave nothing to build.\n" ); return 1; }
 	if (wide.calibrateOnly && !wide.Any()) { printf( "error: -calibrate needs --target and a mesh; there is no layout to time otherwise.\n" ); return 1; }
 	if (wide.calibrateOnly && wide.fix) printf( "note: -calibrate builds its own trees over the whole mesh; -fix does not apply to them.\n" );
@@ -4507,6 +4785,7 @@ int main( int argc, char** argv )
 				bvh.primIdx[node.leftFirst + i], node.aabbMin, node.aabbMax, wide.noSplits );
 	}
 	tinybvh::BVH_Verbose verbose;
+	verbose.settings = bvh.settings; // as for the candidates: ConvertFrom copies neither
 	verbose.ConvertFrom( bvh );
 	verbose.c_trav = bvh.c_trav, verbose.c_int = bvh.c_int, verbose.lQuads = bvh.lQuads;
 	// Without a target the tree stays binary, so the gate is the binary walk, measured with a
@@ -4529,7 +4808,9 @@ int main( int argc, char** argv )
 	bvh.ConvertFrom( verbose );
 
 	const float sah1 = bvh.SAHCost(), epo1 = bvh.EPOCost();
-	printf( "result : %u references, %u nodes, %.1f s\n", bvh.idxCount, bvh.usedNodes, optMs / 1000.0 );
+	const uint32_t depth1 = TreeDepth( bvh );
+	BVH_FATAL_ERROR_IF( depth1 > set.maxDepth, "bvhopt: optimized tree is deeper than -maxdepth allows." );
+	printf( "result : %u references, %u nodes, depth %u, %.1f s\n", bvh.idxCount, bvh.usedNodes, depth1, optMs / 1000.0 );
 	printf( "         SAH %10.4f -> %10.4f (%+6.2f%%)\n", sah0, sah1, 100.0f * (sah1 - sah0) / sah0 );
 	printf( "         EPO %10.4f -> %10.4f (%+6.2f%%)\n", epo0, epo1, 100.0f * (epo1 - epo0) / epo0 );
 	const double trav1 = MeasureTraversal( bvh, 50000, 0xBEEF );
