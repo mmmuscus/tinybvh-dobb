@@ -10776,6 +10776,8 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 	}
 	BVH_FATAL_ERROR_IF( bvh8.usedNodes == 0, "BVH_DOBB::ConvertFrom( .. ), source MBVH is empty." );
 	BVH_FATAL_ERROR_IF( bvh8.mbvhNode[0].isLeaf(), "BVH_DOBB::ConvertFrom( .. ), root is a leaf (scene has 2 triangles or fewer)." );
+	BVH_FATAL_ERROR_IF(bvh8.mayHaveHoles(), "BVH_DOBB::ConvertFrom( .. ), source MBVH may have holes.");
+	BVH_FATAL_ERROR_IF(bvh8.bvh.isOverAABBs(), "BVH_DOBB::ConvertFrom( .. ), source is a BVH over AABBs; triangles required.");
 	// what the encoding and the passes below require of the source
 	for (Index nodeIdx = 0; nodeIdx < bvh8.usedNodes; nodeIdx++)
 	{
