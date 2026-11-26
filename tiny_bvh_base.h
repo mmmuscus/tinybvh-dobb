@@ -5429,6 +5429,10 @@ TEMPLATED int32_t tinybvh_blas_intersect( const BVHBase<Float, Index>* blas, Ray
 		if (blas->layout == LAYOUT_BVH4_CPU) return ((const BVH4_CPU<Float, Index>*)blas)->Intersect( ray );
 		if (blas->layout == LAYOUT_BVH8_SIMD) return ((const BVH8_CPU<Float, Index>*)blas)->Intersect( ray );
 	}
+	if constexpr (sizeof(Float) == 4)
+	{
+		if (blas->layout == LAYOUT_DOBB) return ((const BVH_DOBB<Float, Index>*)blas)->Intersect(ray);
+	}
 	assert( !"unsupported BLAS layout" );
 	return 0;
 }
@@ -5443,6 +5447,10 @@ TEMPLATED bool tinybvh_blas_occluded( const BVHBase<Float, Index>* blas, const R
 	{
 		if (blas->layout == LAYOUT_BVH4_CPU) return ((const BVH4_CPU<Float, Index>*)blas)->IsOccluded( ray );
 		if (blas->layout == LAYOUT_BVH8_SIMD) return ((const BVH8_CPU<Float, Index>*)blas)->IsOccluded( ray );
+	}
+	if constexpr (sizeof(Float) == 4)
+	{
+		if (blas->layout == LAYOUT_DOBB) return ((const BVH_DOBB<Float, Index>*)blas)->IsOccluded(ray);
 	}
 	assert( !"unsupported BLAS layout" );
 	return false;
