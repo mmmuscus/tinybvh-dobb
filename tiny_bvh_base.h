@@ -2304,6 +2304,8 @@ public:
 	using Base::idxCount;
 	using Base::aabbMin;
 	using Base::aabbMax;
+	using Base::refittable;
+	using Base::hasHoles;
 protected:
 	using Base::AlignedAlloc;
 	using Base::AlignedFree;
@@ -2354,6 +2356,7 @@ public:
 	void Build( const Slice& vertices );
 	void Build( const Vertex* vertices, const Index* indices, const Index primCount );
 	void Build( const Slice& vertices, const Index* indices, const Index primCount );
+	void Refit();
 	void ConvertFrom( const MBVH8& original ); // leaves may hold at most 3 triangles.
 	int32_t Intersect( Ray& ray ) const;
 	bool IsOccluded( const Ray& ray ) const;
@@ -2370,6 +2373,10 @@ public:
 	bool forceInternalAABB = false;		// force nodes without leaf children to be unoriented AABB-s
 private:
 	void Quadify();
+	void CalcLeafKDop( const typename MBVH8::MBVHNode& leafNode, DOBBSidebandData& leafSidebandEntry ) const;
+	void CalcInternalKDop( const typename MBVH8::MBVHNode& internalNode, const DOBBSidebandData* sideband, DOBBSidebandData& internalSidebandEntry ) const;
+	void ReprojectExtents( const DOBBSidebandData& childSidebandEntry, const uint8_t candidateRotationIdx, const bvhvec3 (&rotatedAxes)[6], bvhvec3& childMinPoint, bvhvec3& childMaxPoint ) const;
+	void QuantizeNode( BVHNode& dobbNode, const bvhvec3* childMinPoint, const bvhvec3* childMaxPoint, const uint32_t childCount ) const;
 	static void CalcBasisVectorsFromTri( const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2 );
 };
 
@@ -10772,6 +10779,84 @@ TEMPLATED void BVH_DOBB<Float, Index>::Quadify()
 	bvh.Refit(); // the split nodes copied the bounds of their parent.
 }
 
+// Refit: extents only. Topology, slot layout and the per-node rotations stay as they are; the
+// k-DOPs are recomputed from the current vertices and the child boxes requantized in each
+// node's stored frame. Unlike BVH8_CPU::Refit, this does not convert again from the source.
+TEMPLATED void BVH_DOBB<Float, Index>::Refit()
+{
+	BVH_FATAL_ERROR_IF(!refittable, "BVH_DOBB::Refit( .. ), refitting a tree with spatial splits.");
+	BVH_FATAL_ERROR_IF(dobbNode == 0, "BVH_DOBB::Refit( .. ), dobbNode == 0.");
+	BVH_FATAL_ERROR_IF(hasHoles, "BVH_DOBB::Refit( .. ), bvh may have holes.");
+	BVH_FATAL_ERROR_IF(bvh8.usedNodes == 0, "BVH_DOBB::Refit( .. ), the source MBVH is gone.");
+	BVH_FATAL_ERROR_IF(!bvh8.bvh.verts, "BVH_DOBB::Refit( .. ), no vertex data.");
+	// proxy k-DOPs, per MBVH node
+	DOBBSidebandData* sideband = (DOBBSidebandData*)AlignedAlloc( bvh8.usedNodes * sizeof(DOBBSidebandData) );
+	const DOBB_LUT& lut = GetLUT();
+	// pass 1: bottom-up; a child always has a higher index than its parent.
+	for (int64_t nodeIdx = (int64_t)bvh8.usedNodes - 1; nodeIdx >= 0; nodeIdx--)
+	{
+		// start from an empty k-DOP
+		for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
+		{
+			sideband[nodeIdx].kDopPosExtents[axisIdx] = -BVH_FAR;
+			sideband[nodeIdx].kDopNegExtents[axisIdx] = BVH_FAR;
+		}
+		const typename MBVH8::MBVHNode& currNode = bvh8.mbvhNode[nodeIdx];
+		if (currNode.isLeaf()) CalcLeafKDop( currNode, sideband[nodeIdx] );
+		else CalcInternalKDop( currNode, sideband, sideband[nodeIdx] );
+	}
+	// pass 2: top-down. Reproject the k-DOPs into each node's stored frame and requantize.
+	Index stackBvhNodes[DOBB_STACK_SIZE], stackDobbNodes[DOBB_STACK_SIZE];
+	stackBvhNodes[0] = 0, stackDobbNodes[0] = 0;
+	Index stackIdx = 1;
+	while (stackIdx > 0)
+	{
+		// pop the next (MBVH node, DOBB node) pair
+		stackIdx--;
+		const Index currBvhIdx = stackBvhNodes[stackIdx], currDobbIdx = stackDobbNodes[stackIdx];
+		const typename MBVH8::MBVHNode& currBvhNode = bvh8.mbvhNode[currBvhIdx];
+		BVHNode& currDobbNode = dobbNode[currDobbIdx];
+		// child boxes in the node's stored frame
+		const uint8_t rotationIdx = currDobbNode.Rotation();
+		bvhvec3 childMinPoint[8], childMaxPoint[8];
+		if (rotationIdx != DOBB_AABB_ROTATION)
+		{
+			const DOBB_LUT::Mat3f rotation = lut.GetRawEntry( rotationIdx );
+			const bvhvec3 rotatedAxes[6] = {
+				rotation.Column( 0 ), -rotation.Column( 0 ),
+				rotation.Column( 1 ), -rotation.Column( 1 ),
+				rotation.Column( 2 ), -rotation.Column( 2 )
+			};
+			// reproject the children's k-DOPs onto the signed axes of the frame
+			for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
+				ReprojectExtents( sideband[currBvhNode.child[childIdx]], rotationIdx, rotatedAxes, childMinPoint[childIdx], childMaxPoint[childIdx] );
+		}
+		else for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
+		{
+			// unrotated: the child boxes are the AABB part of the k-DOPs
+			const float* childNegExtents = sideband[currBvhNode.child[childIdx]].kDopNegExtents;
+			const float* childPosExtents = sideband[currBvhNode.child[childIdx]].kDopPosExtents;
+			childMinPoint[childIdx] = bvhvec3( childNegExtents[0], childNegExtents[1], childNegExtents[2] );
+			childMaxPoint[childIdx] = bvhvec3( childPosExtents[0], childPosExtents[1], childPosExtents[2] );
+		}
+		// quantization grid and quantized child bounds; slots, child base and rotation stay as they are
+		QuantizeNode( currDobbNode, childMinPoint, childMaxPoint, currBvhNode.childCount );
+		// interior children: their DOBB nodes follow the child base in slot order
+		for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
+		{
+			if (!(currDobbNode.iMask & (1u << childIdx))) continue;
+			BVH_FATAL_ERROR_IF(stackIdx >= DOBB_STACK_SIZE, "BVH_DOBB::Refit( .. ), stack overflow; the tree is too deep.");
+			stackBvhNodes[stackIdx] = currBvhNode.child[childIdx];
+			stackDobbNodes[stackIdx++] = currDobbNode.ChildBaseIndex() + tinybvh_popc( currDobbNode.iMask & ((1u << childIdx) - 1) );
+		}
+	}
+	// root bounds, for a TLAS over this BLAS
+	aabbMin = bvhvec3( sideband[0].kDopNegExtents[0], sideband[0].kDopNegExtents[1], sideband[0].kDopNegExtents[2] );
+	aabbMax = bvhvec3( sideband[0].kDopPosExtents[0], sideband[0].kDopPosExtents[1], sideband[0].kDopPosExtents[2] );
+	// cleanup
+	AlignedFree( sideband );
+}
+
 // Convert an MBVH<8> with at most 2 triangles per leaf to the DOBB layout. Pass 1 builds
 // proxy k-DOPs and candidate rotations bottom-up; pass 2 emits compressed nodes top-down.
 TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
@@ -10871,33 +10956,14 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 			}
 			// best rotation candidate for the leaf frame
 			sideband[nodeIdx].rotation = lut.GetRotationForBasis( { a0, a1, a2 } );
-			// proxy k-DOP, to propagate upwards: over every vertex of every triangle in the leaf
-			for (Index triIdx = 0; triIdx < currNode.triCount; triIdx++)
-			{
-				GET_PRIM_INDICES_I0_I1_I2( bvh8.bvh, bvh8.bvh.primIdx[currNode.firstTri + triIdx] );
-				const bvhvec3 triVerts[3] = { bvh8.bvh.verts[i0], bvh8.bvh.verts[i1], bvh8.bvh.verts[i2] };
-				for (uint32_t vertIdx = 0; vertIdx < 3; vertIdx++)
-					for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
-					{
-						const float projection = tinybvh_dot( proxyKDopAxes[axisIdx], triVerts[vertIdx] );
-						sideband[nodeIdx].kDopNegExtents[axisIdx] = tinybvh_min( projection, sideband[nodeIdx].kDopNegExtents[axisIdx] );
-						sideband[nodeIdx].kDopPosExtents[axisIdx] = tinybvh_max( projection, sideband[nodeIdx].kDopPosExtents[axisIdx] );
-					}
-			}
+			// Calculate proxy k-DOP for leaf node
+			CalcLeafKDop( currNode, sideband[nodeIdx] );
 			continue;
 		}
-		// interior node
+		// internal node
 		nodesNeeded++;
-		// k-DOP: union of the children's k-DOPs
-		for (uint32_t childIdx = 0; childIdx < currNode.childCount; childIdx++)
-		{
-			const Index currChildIdx = currNode.child[childIdx];
-			for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
-			{
-				sideband[nodeIdx].kDopNegExtents[axisIdx] = tinybvh_min( sideband[currChildIdx].kDopNegExtents[axisIdx], sideband[nodeIdx].kDopNegExtents[axisIdx] );
-				sideband[nodeIdx].kDopPosExtents[axisIdx] = tinybvh_max( sideband[currChildIdx].kDopPosExtents[axisIdx], sideband[nodeIdx].kDopPosExtents[axisIdx] );
-			}
-		}
+		// Calculate proxy k-DOP for internal node
+		CalcInternalKDop( currNode, sideband, sideband[nodeIdx] );
 		// candidate rotation: that of the child with the largest AABB surface area
 		float AABBSAMax = 0.0f;
 		uint8_t candidateRotationIdx = 0;
@@ -10951,7 +11017,6 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 			candidateRotation.Column( 1 ), -candidateRotation.Column( 1 ),
 			candidateRotation.Column( 2 ), -candidateRotation.Column( 2 )
 		};
-		float rotatedAxesExtents[6];
 		bool hasLeafSlot = false;
 		// child boxes in the candidate frame, and their summed surface area
 		float DOBBSASum = 0.0f;
@@ -10959,29 +11024,9 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 		for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
 		{
 			const Index currChildIdx = currBvhNode.child[childIdx];
-			// reproject the child's k-DOP onto each signed axis of the candidate frame
-			for (uint32_t rotatedAxesIdx = 0; rotatedAxesIdx < 6; rotatedAxesIdx++)
-			{
-				const DOBB_LUT::ReprojectionEntry& reprojection = lut.reprojectionLUT[candidateRotationIdx][rotatedAxesIdx];
-				// normals of the selected planes
-				const bvhvec3 v0 = proxyKDopAxes[reprojection.axisIdx[0]] * (float)reprojection.sign[0];
-				const bvhvec3 v1 = proxyKDopAxes[reprojection.axisIdx[1]] * (float)reprojection.sign[1];
-				const bvhvec3 v2 = proxyKDopAxes[reprojection.axisIdx[2]] * (float)reprojection.sign[2];
-				// distances of the selected planes
-				const float* childNegExtents = sideband[currChildIdx].kDopNegExtents;
-				const float* childPosExtents = sideband[currChildIdx].kDopPosExtents;
-				const float h0 = reprojection.sign[0] == 1 ? childPosExtents[reprojection.axisIdx[0]] : -childNegExtents[reprojection.axisIdx[0]];
-				const float h1 = reprojection.sign[1] == 1 ? childPosExtents[reprojection.axisIdx[1]] : -childNegExtents[reprojection.axisIdx[1]];
-				const float h2 = reprojection.sign[2] == 1 ? childPosExtents[reprojection.axisIdx[2]] : -childNegExtents[reprojection.axisIdx[2]];
-				// apex point: intersection of the three planes
-				const bvhvec3 c0 = tinybvh_cross( v1, v2 );
-				const bvhvec3 apexPoint = (c0 * h0 + tinybvh_cross( v2, v0 ) * h1 + tinybvh_cross( v0, v1 ) * h2) / tinybvh_dot( v0, c0 );
-				// axis extent: projection of the apex point onto the axis
-				rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot( rotatedAxes[rotatedAxesIdx], apexPoint );
-			}
-			// rotatedAxesExtents: even = extent along +axis (max), odd = extent along -axis (-min)
-			childMinPoint[childIdx] = bvhvec3( -rotatedAxesExtents[1], -rotatedAxesExtents[3], -rotatedAxesExtents[5] );
-			childMaxPoint[childIdx] = bvhvec3( rotatedAxesExtents[0], rotatedAxesExtents[2], rotatedAxesExtents[4] );
+			// reproject the child's extents onto the candidate orientation frame
+			ReprojectExtents( sideband[currChildIdx], candidateRotationIdx, rotatedAxes, childMinPoint[childIdx], childMaxPoint[childIdx] );
+			// Calculate DOBBSA and hasLeafSlot
 			const float a = childMaxPoint[childIdx].x - childMinPoint[childIdx].x;
 			const float b = childMaxPoint[childIdx].y - childMinPoint[childIdx].y;
 			const float c = childMaxPoint[childIdx].z - childMinPoint[childIdx].z;
@@ -11002,38 +11047,12 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 				childMaxPoint[childIdx] = bvhvec3( childPosExtents[0], childPosExtents[1], childPosExtents[2] );
 			}
 		}
-		// quantization frame: union of the child boxes
-		bvhvec3 minPoint( BVH_FAR ), maxPoint( -BVH_FAR );
-		for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
-		{
-			minPoint = tinybvh_min( minPoint, childMinPoint[childIdx] );
-			maxPoint = tinybvh_max( maxPoint, childMaxPoint[childIdx] );
-		}
-		currDobbNode.nodeMinPoint = minPoint;
-		float inverseScale[3]; // 2^-exponent, exact
-		for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++)
-		{
-			const float extent = maxPoint[axisIdx] - minPoint[axisIdx];
-			// guard against flat boxes
-			int32_t exponent = extent > 0.0f ? (int32_t)ceilf( log2f( extent / 255.0f ) ) : -126;
-			// clamp into int8_t range
-			exponent = tinybvh_clamp( exponent, -126, 127 );
-			// guard against ceil( log2f( .. ) ) rounding to an exponent that is too small
-			if (exponent < 127 && ldexpf( 255.0f, exponent ) < extent) exponent++;
-			currDobbNode.exponent[axisIdx] = (int8_t)exponent;
-			inverseScale[axisIdx] = ldexpf( 1.0f, -exponent );
-		}
-		// fill the slots: quantized bounds, then interior children or leaf triangles
+		// quantization grid and quantized child bounds
+		QuantizeNode( currDobbNode, childMinPoint, childMaxPoint, currBvhNode.childCount );
+		// fill the slots: interior children or leaf triangles
 		Index currDobbNodeChildBaseIdx = 0, currDobbNodeInternalChildCount = 0, currDobbNodeTriCount = 0;
 		for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
 		{
-			// quantize, rounding outwards
-			currDobbNode.qLo[0][childIdx] = (uint8_t)tinybvh_clamp( floorf( (childMinPoint[childIdx][0] - minPoint[0]) * inverseScale[0] ), 0.0f, 255.0f );
-			currDobbNode.qLo[1][childIdx] = (uint8_t)tinybvh_clamp( floorf( (childMinPoint[childIdx][1] - minPoint[1]) * inverseScale[1] ), 0.0f, 255.0f );
-			currDobbNode.qLo[2][childIdx] = (uint8_t)tinybvh_clamp( floorf( (childMinPoint[childIdx][2] - minPoint[2]) * inverseScale[2] ), 0.0f, 255.0f );
-			currDobbNode.qHi[0][childIdx] = (uint8_t)tinybvh_clamp( ceilf( (childMaxPoint[childIdx][0] - minPoint[0]) * inverseScale[0] ), 0.0f, 255.0f );
-			currDobbNode.qHi[1][childIdx] = (uint8_t)tinybvh_clamp( ceilf( (childMaxPoint[childIdx][1] - minPoint[1]) * inverseScale[1] ), 0.0f, 255.0f );
-			currDobbNode.qHi[2][childIdx] = (uint8_t)tinybvh_clamp( ceilf( (childMaxPoint[childIdx][2] - minPoint[2]) * inverseScale[2] ), 0.0f, 255.0f );
 			const Index currChildIdx = currBvhNode.child[childIdx];
 			const typename MBVH8::MBVHNode& currChild = bvh8.mbvhNode[currChildIdx];
 			if (!currChild.isLeaf())
@@ -11063,6 +11082,38 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 	sideband = 0;
 }
 
+TEMPLATED void BVH_DOBB<Float, Index>::CalcLeafKDop( const typename MBVH8::MBVHNode& leafNode, DOBBSidebandData& leafSidebandEntry ) const
+{
+	// proxy k-DOP, to propagate upwards: over every vertex of every triangle in the leaf
+	for (Index triIdx = 0; triIdx < leafNode.triCount; triIdx++)
+	{
+		Index i0, i1, i2; // for GET_PRIM_INDICES_I0_I1_I2
+		GET_PRIM_INDICES_I0_I1_I2( bvh8.bvh, bvh8.bvh.primIdx[leafNode.firstTri + triIdx] );
+		const bvhvec3 triVerts[3] = { bvh8.bvh.verts[i0], bvh8.bvh.verts[i1], bvh8.bvh.verts[i2] };
+		for (uint32_t vertIdx = 0; vertIdx < 3; vertIdx++)
+			for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
+			{
+				const float projection = tinybvh_dot( proxyKDopAxes[axisIdx], triVerts[vertIdx] );
+				leafSidebandEntry.kDopNegExtents[axisIdx] = tinybvh_min( projection, leafSidebandEntry.kDopNegExtents[axisIdx] );
+				leafSidebandEntry.kDopPosExtents[axisIdx] = tinybvh_max( projection, leafSidebandEntry.kDopPosExtents[axisIdx] );
+			}
+	}
+}
+
+TEMPLATED void BVH_DOBB<Float, Index>::CalcInternalKDop( const typename MBVH8::MBVHNode& internalNode, const DOBBSidebandData* sideband, DOBBSidebandData& internalSidebandEntry ) const
+{
+	// k-DOP: union of the children's k-DOPs
+	for (uint32_t childIdx = 0; childIdx < internalNode.childCount; childIdx++)
+	{
+		const DOBBSidebandData& currChildSidebandEntry = sideband[internalNode.child[childIdx]];
+		for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
+		{
+			internalSidebandEntry.kDopNegExtents[axisIdx] = tinybvh_min( currChildSidebandEntry.kDopNegExtents[axisIdx], internalSidebandEntry.kDopNegExtents[axisIdx] );
+			internalSidebandEntry.kDopPosExtents[axisIdx] = tinybvh_max( currChildSidebandEntry.kDopPosExtents[axisIdx], internalSidebandEntry.kDopPosExtents[axisIdx] );
+		}
+	}
+}
+
 TEMPLATED void BVH_DOBB<Float, Index>::CalcBasisVectorsFromTri( const bvhvec3* triVerts, bvhvec3& a0, bvhvec3& a1, bvhvec3& a2 )
 {
 	// a0 and a1 are the two shorter edges, from the vertex they share.
@@ -11083,6 +11134,71 @@ TEMPLATED void BVH_DOBB<Float, Index>::CalcBasisVectorsFromTri( const bvhvec3* t
 	a0 = tinybvh_normalize( a0 );
 	a2 = tinybvh_normalize( tinybvh_cross( a0, a1 ) );
 	a1 = tinybvh_normalize( tinybvh_cross( a2, a0 ) ); // normalized for safety
+}
+
+TEMPLATED void BVH_DOBB<Float, Index>::ReprojectExtents( const DOBBSidebandData& childSidebandEntry, const uint8_t candidateRotationIdx, const bvhvec3 (&rotatedAxes)[6], bvhvec3& childMinPoint, bvhvec3& childMaxPoint ) const
+{
+	float rotatedAxesExtents[6];
+	const DOBB_LUT& lut = GetLUT();
+	// reproject the child's k-DOP onto each signed axis of the candidate frame
+	for (uint32_t rotatedAxesIdx = 0; rotatedAxesIdx < 6; rotatedAxesIdx++)
+	{
+		const DOBB_LUT::ReprojectionEntry& reprojection = lut.reprojectionLUT[candidateRotationIdx][rotatedAxesIdx];
+		// normals of the selected planes
+		const bvhvec3 v0 = proxyKDopAxes[reprojection.axisIdx[0]] * (float)reprojection.sign[0];
+		const bvhvec3 v1 = proxyKDopAxes[reprojection.axisIdx[1]] * (float)reprojection.sign[1];
+		const bvhvec3 v2 = proxyKDopAxes[reprojection.axisIdx[2]] * (float)reprojection.sign[2];
+		// distances of the selected planes
+		const float* childNegExtents = childSidebandEntry.kDopNegExtents;
+		const float* childPosExtents = childSidebandEntry.kDopPosExtents;
+		const float h0 = reprojection.sign[0] == 1 ? childPosExtents[reprojection.axisIdx[0]] : -childNegExtents[reprojection.axisIdx[0]];
+		const float h1 = reprojection.sign[1] == 1 ? childPosExtents[reprojection.axisIdx[1]] : -childNegExtents[reprojection.axisIdx[1]];
+		const float h2 = reprojection.sign[2] == 1 ? childPosExtents[reprojection.axisIdx[2]] : -childNegExtents[reprojection.axisIdx[2]];
+		// apex point: intersection of the three planes
+		const bvhvec3 c0 = tinybvh_cross( v1, v2 );
+		const bvhvec3 apexPoint = (c0 * h0 + tinybvh_cross( v2, v0 ) * h1 + tinybvh_cross( v0, v1 ) * h2) / tinybvh_dot( v0, c0 );
+		// axis extent: projection of the apex point onto the axis
+		rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot( rotatedAxes[rotatedAxesIdx], apexPoint );
+	}
+	// rotatedAxesExtents: even = extent along +axis (max), odd = extent along -axis (-min)
+	childMinPoint = bvhvec3( -rotatedAxesExtents[1], -rotatedAxesExtents[3], -rotatedAxesExtents[5] );
+	childMaxPoint = bvhvec3( rotatedAxesExtents[0], rotatedAxesExtents[2], rotatedAxesExtents[4] );
+}
+
+TEMPLATED void BVH_DOBB<Float, Index>::QuantizeNode( BVHNode& dobbNode, const bvhvec3* childMinPoint, const bvhvec3* childMaxPoint, const uint32_t childCount ) const
+{
+	// quantization frame: union of the child boxes
+	bvhvec3 minPoint( BVH_FAR ), maxPoint( -BVH_FAR );
+	for (uint32_t childIdx = 0; childIdx < childCount; childIdx++)
+	{
+		minPoint = tinybvh_min( minPoint, childMinPoint[childIdx] );
+		maxPoint = tinybvh_max( maxPoint, childMaxPoint[childIdx] );
+	}
+	dobbNode.nodeMinPoint = minPoint;
+	float inverseScale[3]; // 2^-exponent, exact
+	for (uint32_t axisIdx = 0; axisIdx < 3; axisIdx++)
+	{
+		const float extent = maxPoint[axisIdx] - minPoint[axisIdx];
+		// guard against flat boxes
+		int32_t exponent = extent > 0.0f ? (int32_t)ceilf( log2f( extent / 255.0f ) ) : -126;
+		// clamp into int8_t range
+		exponent = tinybvh_clamp( exponent, -126, 127 );
+		// guard against ceil( log2f( .. ) ) rounding to an exponent that is too small
+		if (exponent < 127 && ldexpf( 255.0f, exponent ) < extent) exponent++;
+		dobbNode.exponent[axisIdx] = (int8_t)exponent;
+		inverseScale[axisIdx] = ldexpf( 1.0f, -exponent );
+	}
+	// Calculate the quantizted bounds
+	for (uint32_t childIdx = 0; childIdx < childCount; childIdx++)
+	{
+		// quantize, rounding outwards
+		dobbNode.qLo[0][childIdx] = (uint8_t)tinybvh_clamp( floorf( (childMinPoint[childIdx][0] - minPoint[0]) * inverseScale[0] ), 0.0f, 255.0f );
+		dobbNode.qLo[1][childIdx] = (uint8_t)tinybvh_clamp( floorf( (childMinPoint[childIdx][1] - minPoint[1]) * inverseScale[1] ), 0.0f, 255.0f );
+		dobbNode.qLo[2][childIdx] = (uint8_t)tinybvh_clamp( floorf( (childMinPoint[childIdx][2] - minPoint[2]) * inverseScale[2] ), 0.0f, 255.0f );
+		dobbNode.qHi[0][childIdx] = (uint8_t)tinybvh_clamp( ceilf( (childMaxPoint[childIdx][0] - minPoint[0]) * inverseScale[0] ), 0.0f, 255.0f );
+		dobbNode.qHi[1][childIdx] = (uint8_t)tinybvh_clamp( ceilf( (childMaxPoint[childIdx][1] - minPoint[1]) * inverseScale[1] ), 0.0f, 255.0f );
+		dobbNode.qHi[2][childIdx] = (uint8_t)tinybvh_clamp( ceilf( (childMaxPoint[childIdx][2] - minPoint[2]) * inverseScale[2] ), 0.0f, 255.0f );
+	}
 }
 
 TEMPLATED int32_t BVH_DOBB<Float, Index>::Intersect( Ray& ray ) const
