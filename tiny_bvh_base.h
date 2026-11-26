@@ -2222,14 +2222,18 @@ private:
 #define DOBB_MAX_ROTATION_VALUES 44	// distinct values over all rotation matrix entries.
 #define DOBB_AABB_ROTATION 255		// rotation index of a node that is not rotated.
 #define DOBB_STACK_SIZE 512			// stack size for conversion and traversal.
+#define DOBB_PI 3.14159265358979f	// PI for DOBB, move to more generic place once multiple BVH require it
 #ifndef DOBB_ALPHA
 #define DOBB_ALPHA 0.9f				// rotate a node if its oriented SA < alpha * AABB SA.
 #endif
 
+static_assert( DOBB_ROTATION_COUNT < DOBB_AABB_ROTATION, "rotation indices are uint8_t and 255 means 'no rotation'" );
+
 // Per-node data that only exists during BVH_DOBB::ConvertFrom.
 struct DOBBSidebandData
 {
-	bvhvec2 kDopExtents[DOBB_AXIS_COUNT];	// per proxy axis: x = min, y = max.
+	float kDopNegExtents[DOBB_AXIS_COUNT];	// per proxy axis: min extent
+	float kDopPosExtents[DOBB_AXIS_COUNT];	// per proxy axis: max extent
 	uint8_t rotation;						// candidate rotation, propagated upwards.
 	float AABBSASum;						// summed child AABB surface area; interior nodes only.
 };
@@ -2239,15 +2243,18 @@ struct DOBBSidebandData
 class DOBB_LUT
 {
 public:
-	static constexpr float PI = 3.14159265358979f;
 	static constexpr uint32_t AZIMUTH_BINS = 32, POLAR_BINS = 16, ANGLE_BINS = 16;
-	struct Mat3f { float m[3][3]; };
-	struct Mat3i { uint8_t m[3][3]; };	// indices into rotationValues.
+	struct Mat3f
+	{
+		float m[3][3];
+		bvhvec3 Column( const uint32_t columnIdx ) const { return bvhvec3( m[0][columnIdx], m[1][columnIdx], m[2][columnIdx] ); }
+	};
+	struct Mat3i { uint8_t m[3][3]; };	// indices into rotationValueLUT.
 	struct ReprojectionEntry
 	{
 		// the three proxy planes whose apex point bounds a k-DOP in one direction.
 		uint8_t axisIdx[3];
-		int sign[3];
+		int8_t sign[3];
 	};
 	DOBB_LUT()
 	{
@@ -2258,17 +2265,17 @@ public:
 	Mat3f GetRawEntry( const uint32_t rotIdx ) const;
 	uint8_t GetRotationForBasis( const bvhvec3( &basis )[3] ) const;
 	// LUT data
-	float rotationValues[DOBB_MAX_ROTATION_VALUES];
-	Mat3i rotations[DOBB_ROTATION_COUNT];
-	ReprojectionEntry reprojections[DOBB_ROTATION_COUNT][6];
-	uint8_t azimuthAngles[AZIMUTH_BINS * POLAR_BINS * ANGLE_BINS];
+	float rotationValueLUT[DOBB_MAX_ROTATION_VALUES];
+	Mat3i rotationLUT[DOBB_ROTATION_COUNT];
+	ReprojectionEntry reprojectionLUT[DOBB_ROTATION_COUNT][6];
+	uint8_t axisAzimuthLUT[AZIMUTH_BINS * POLAR_BINS * ANGLE_BINS];
 private:
 	static Mat3f RodriguesRotMat( const bvhvec3& axis, const float angle );
 	static void BasisToAxisAngle( const bvhvec3( &basis )[3], bvhvec3& axis, float& angle );
 	static uint32_t ToBin( const float fraction, const uint32_t binCount );
 	static uint32_t AxisAngleToCell( const bvhvec3& axis, const float angle );
 	static void FindQuadSphereTriangle( const bvhvec3& direction, ReprojectionEntry& entry );
-	static void QuadSpherePointToProxyAxis( const float quadSpherePoint[3], uint8_t& axisIdx, int& sign );
+	static void QuadSpherePointToProxyAxis( const bvhvec3& quadSpherePoint, uint8_t& axisIdx, int8_t& sign );
 	float Similarity( const bvhvec3( &capitalB )[3], const uint32_t rotIdx ) const;
 	uint8_t BruteForceBestRotation( const bvhvec3( &basis )[3] ) const;
 	void BuildRotationLUT();
@@ -10444,9 +10451,9 @@ DOBB_LUT::Mat3f DOBB_LUT::GetRawEntry( const uint32_t rotIdx ) const
 {
 	// expand an indexed rotation into a float matrix.
 	Mat3f ret;
-	const Mat3i& rotMat = rotations[rotIdx];
+	const Mat3i& rotMat = rotationLUT[rotIdx];
 	for (uint32_t rowIdx = 0; rowIdx < 3; rowIdx++) for (uint32_t colIdx = 0; colIdx < 3; colIdx++)
-		ret.m[rowIdx][colIdx] = rotationValues[rotMat.m[rowIdx][colIdx]];
+		ret.m[rowIdx][colIdx] = rotationValueLUT[rotMat.m[rowIdx][colIdx]];
 	return ret;
 }
 
@@ -10455,7 +10462,7 @@ uint8_t DOBB_LUT::GetRotationForBasis( const bvhvec3( &basis )[3] ) const
 	bvhvec3 axis;
 	float angle;
 	BasisToAxisAngle( basis, axis, angle );
-	return azimuthAngles[AxisAngleToCell( axis, angle )];
+	return axisAzimuthLUT[AxisAngleToCell( axis, angle )];
 }
 
 // Rodrigues' rotation formula, https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula.
@@ -10479,7 +10486,7 @@ DOBB_LUT::Mat3f DOBB_LUT::RodriguesRotMat( const bvhvec3& axis, const float angl
 void DOBB_LUT::BuildRotationLUT()
 {
 	// rotations by i * delta, i = 1..m, in both directions, about each proxy axis.
-	const float delta = PI / (2.0f * DOBB_SMALL_M);
+	const float delta = DOBB_PI / (2.0f * DOBB_SMALL_M);
 	Mat3f rawRotations[DOBB_ROTATION_COUNT];
 	uint32_t rotationsIdx = 0;
 	for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++) for (int i = 1; i <= DOBB_SMALL_M; i++)
@@ -10495,16 +10502,16 @@ void DOBB_LUT::BuildRotationLUT()
 			const float currRawValue = rawRotations[rotIdx].m[rowIdx][colIdx];
 			bool found = false;
 			for (uint8_t rotValIdx = 0; rotValIdx < rotValUsed; rotValIdx++)
-				if (fabsf( rotationValues[rotValIdx] - currRawValue ) < 0.000001f)
+				if (fabsf( rotationValueLUT[rotValIdx] - currRawValue ) < 0.000001f)
 				{
 					found = true;
-					rotations[rotIdx].m[rowIdx][colIdx] = rotValIdx;
+					rotationLUT[rotIdx].m[rowIdx][colIdx] = rotValIdx;
 					break;
 				}
 			if (found) continue;
 			BVH_FATAL_ERROR_IF( rotValUsed >= DOBB_MAX_ROTATION_VALUES, "DOBB_LUT::BuildRotationLUT(), more distinct rotation values than DOBB_MAX_ROTATION_VALUES." );
-			rotationValues[rotValUsed] = currRawValue;
-			rotations[rotIdx].m[rowIdx][colIdx] = rotValUsed++;
+			rotationValueLUT[rotValUsed] = currRawValue;
+			rotationLUT[rotIdx].m[rowIdx][colIdx] = rotValUsed++;
 		}
 }
 
@@ -10516,10 +10523,9 @@ void DOBB_LUT::BuildReprojectionLUT()
 		const Mat3f rotation = GetRawEntry( rotationIdx );
 		for (uint32_t candidateRotAxisIdx = 0; candidateRotAxisIdx < 3; candidateRotAxisIdx++)
 		{
-			const bvhvec3 candidateAxis( rotation.m[0][candidateRotAxisIdx],
-				rotation.m[1][candidateRotAxisIdx], rotation.m[2][candidateRotAxisIdx] );
-			FindQuadSphereTriangle( candidateAxis, reprojections[rotationIdx][candidateRotAxisIdx * 2] );
-			FindQuadSphereTriangle( -candidateAxis, reprojections[rotationIdx][candidateRotAxisIdx * 2 + 1] );
+			const bvhvec3 candidateAxis = rotation.Column( candidateRotAxisIdx );
+			FindQuadSphereTriangle( candidateAxis, reprojectionLUT[rotationIdx][candidateRotAxisIdx * 2] );
+			FindQuadSphereTriangle( -candidateAxis, reprojectionLUT[rotationIdx][candidateRotAxisIdx * 2 + 1] );
 		}
 	}
 }
@@ -10547,7 +10553,7 @@ void DOBB_LUT::BasisToAxisAngle( const bvhvec3( &basis )[3], bvhvec3& axis, floa
 		uint32_t largestIdx = 0;
 		if (diagonal[1] > diagonal[largestIdx]) largestIdx = 1;
 		if (diagonal[2] > diagonal[largestIdx]) largestIdx = 2;
-		float components[3];
+		bvhvec3 components;
 		components[largestIdx] = sqrtf( tinybvh_max( (diagonal[largestIdx] + 1.0f) * 0.5f, 0.0f ) );
 		for (uint32_t componentIdx = 0; componentIdx < 3; componentIdx++)
 		{
@@ -10556,7 +10562,7 @@ void DOBB_LUT::BasisToAxisAngle( const bvhvec3( &basis )[3], bvhvec3& axis, floa
 			const float symmetricSum = basis[componentIdx][largestIdx] + basis[largestIdx][componentIdx];
 			components[componentIdx] = symmetricSum / (4.0f * components[largestIdx]);
 		}
-		axis = tinybvh_normalize( bvhvec3( components[0], components[1], components[2] ) );
+		axis = tinybvh_normalize( components );
 	}
 }
 
@@ -10570,9 +10576,9 @@ uint32_t DOBB_LUT::AxisAngleToCell( const bvhvec3& axis, const float angle )
 	// slot an (axis, angle) combination into the quantized cells.
 	const float azimuth = atan2f( axis.y, axis.x );
 	const float polar = acosf( tinybvh_clamp( axis.z, -1.0f, 1.0f ) );
-	const uint32_t azimuthBin = ToBin( (azimuth + PI) / (2.0f * PI), AZIMUTH_BINS );
-	const uint32_t polarBin = ToBin( polar / PI, POLAR_BINS );
-	const uint32_t angleBin = ToBin( angle / PI, ANGLE_BINS );
+	const uint32_t azimuthBin = ToBin( (azimuth + DOBB_PI) / (2.0f * DOBB_PI), AZIMUTH_BINS );
+	const uint32_t polarBin = ToBin( polar / DOBB_PI, POLAR_BINS );
+	const uint32_t angleBin = ToBin( angle / DOBB_PI, ANGLE_BINS );
 	return (angleBin * POLAR_BINS + polarBin) * AZIMUTH_BINS + azimuthBin;
 }
 
@@ -10583,7 +10589,7 @@ float DOBB_LUT::Similarity( const bvhvec3( &capitalB )[3], const uint32_t rotIdx
 	Mat3f dotMat;
 	for (uint32_t i = 0; i < 3; i++)
 	{
-		const bvhvec3 r( rotMat.m[0][i], rotMat.m[1][i], rotMat.m[2][i] );
+		const bvhvec3 r = rotMat.Column( i );
 		for (uint32_t j = 0; j < 3; j++) dotMat.m[i][j] = fabsf( tinybvh_dot( r, capitalB[j] ) );
 	}
 	static const int Perms[6][3] = { { 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 }, { 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 } };
@@ -10612,18 +10618,14 @@ void DOBB_LUT::BuildAxisAzimuthLUT()
 		for (uint32_t polarBin = 0; polarBin < POLAR_BINS; polarBin++)
 			for (uint32_t azimuthBin = 0; azimuthBin < AZIMUTH_BINS; azimuthBin++)
 			{
-				const float angle = (angleBin + 0.5f) / ANGLE_BINS * PI;
-				const float polar = (polarBin + 0.5f) / POLAR_BINS * PI;
-				const float azimuth = (azimuthBin + 0.5f) / AZIMUTH_BINS * 2.0f * PI - PI;
+				const float angle = (angleBin + 0.5f) / ANGLE_BINS * DOBB_PI;
+				const float polar = (polarBin + 0.5f) / POLAR_BINS * DOBB_PI;
+				const float azimuth = (azimuthBin + 0.5f) / AZIMUTH_BINS * 2.0f * DOBB_PI - DOBB_PI;
 				const bvhvec3 axis( sinf( polar ) * cosf( azimuth ), sinf( polar ) * sinf( azimuth ), cosf( polar ) );
 				const Mat3f cellRotation = RodriguesRotMat( axis, angle );
-				const bvhvec3 basis[3] = {
-					bvhvec3( cellRotation.m[0][0], cellRotation.m[1][0], cellRotation.m[2][0] ),
-					bvhvec3( cellRotation.m[0][1], cellRotation.m[1][1], cellRotation.m[2][1] ),
-					bvhvec3( cellRotation.m[0][2], cellRotation.m[1][2], cellRotation.m[2][2] )
-				};
+				const bvhvec3 basis[3] = { cellRotation.Column( 0 ), cellRotation.Column( 1 ), cellRotation.Column( 2 ) };
 				const uint32_t cellIdx = (angleBin * POLAR_BINS + polarBin) * AZIMUTH_BINS + azimuthBin;
-				azimuthAngles[cellIdx] = BruteForceBestRotation( basis );
+				axisAzimuthLUT[cellIdx] = BruteForceBestRotation( basis );
 			}
 }
 
@@ -10631,34 +10633,33 @@ void DOBB_LUT::BuildAxisAzimuthLUT()
 // a corner of the unit cube.
 void DOBB_LUT::FindQuadSphereTriangle( const bvhvec3& direction, ReprojectionEntry& entry )
 {
-	const float components[3] = { direction.x, direction.y, direction.z };
 	// face center
-	float faceCenter[3] = { 0.0f, 0.0f, 0.0f };
+	bvhvec3 faceCenter( 0.0f );
 	uint8_t majorAxis = 0;
-	if (fabsf( components[1] ) > fabsf( components[majorAxis] )) majorAxis = 1;
-	if (fabsf( components[2] ) > fabsf( components[majorAxis] )) majorAxis = 2;
-	faceCenter[majorAxis] = components[majorAxis] >= 0.0f ? 1.0f : -1.0f;
+	if (fabsf( direction[1] ) > fabsf( direction[majorAxis] )) majorAxis = 1;
+	if (fabsf( direction[2] ) > fabsf( direction[majorAxis] )) majorAxis = 2;
+	faceCenter[majorAxis] = direction[majorAxis] >= 0.0f ? 1.0f : -1.0f;
 	QuadSpherePointToProxyAxis( faceCenter, entry.axisIdx[0], entry.sign[0] );
 	// cube corner
-	float cubeCorner[3] = { faceCenter[0], faceCenter[1], faceCenter[2] };
+	bvhvec3 cubeCorner = faceCenter;
 	const int minorAxisFirst = (majorAxis + 1) % 3, minorAxisSecond = (majorAxis + 2) % 3;
-	const float minorAxisFirstSign = components[minorAxisFirst] >= 0.0f ? 1.0f : -1.0f;
-	const float minorAxisSecondSign = components[minorAxisSecond] >= 0.0f ? 1.0f : -1.0f;
+	const float minorAxisFirstSign = direction[minorAxisFirst] >= 0.0f ? 1.0f : -1.0f;
+	const float minorAxisSecondSign = direction[minorAxisSecond] >= 0.0f ? 1.0f : -1.0f;
 	cubeCorner[minorAxisFirst] = minorAxisFirstSign;
 	cubeCorner[minorAxisSecond] = minorAxisSecondSign;
 	QuadSpherePointToProxyAxis( cubeCorner, entry.axisIdx[1], entry.sign[1] );
 	// edge midpoint
-	float edgeMidPoint[3] = { faceCenter[0], faceCenter[1], faceCenter[2] };
-	if (fabsf( components[minorAxisFirst] ) >= fabsf( components[minorAxisSecond] ))
+	bvhvec3 edgeMidPoint = faceCenter;
+	if (fabsf( direction[minorAxisFirst] ) >= fabsf( direction[minorAxisSecond] ))
 		edgeMidPoint[minorAxisFirst] = minorAxisFirstSign;
 	else
 		edgeMidPoint[minorAxisSecond] = minorAxisSecondSign;
 	QuadSpherePointToProxyAxis( edgeMidPoint, entry.axisIdx[2], entry.sign[2] );
 }
 
-void DOBB_LUT::QuadSpherePointToProxyAxis( const float quadSpherePoint[3], uint8_t& axisIdx, int& sign )
+void DOBB_LUT::QuadSpherePointToProxyAxis( const bvhvec3& quadSpherePoint, uint8_t& axisIdx, int8_t& sign )
 {
-	const bvhvec3 pointDirection = tinybvh_normalize( bvhvec3( quadSpherePoint[0], quadSpherePoint[1], quadSpherePoint[2] ) );
+	const bvhvec3 pointDirection = tinybvh_normalize( quadSpherePoint );
 	for (uint8_t proxyAxisIdx = 0; proxyAxisIdx < DOBB_AXIS_COUNT; proxyAxisIdx++)
 	{
 		const float alignment = tinybvh_dot( proxyKDopAxes[proxyAxisIdx], pointDirection );
@@ -10796,8 +10797,10 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 	// pass 1: bottom-up; a child always has a higher index than its parent.
 	for (int64_t nodeIdx = (int64_t)bvh8.usedNodes - 1; nodeIdx >= 0; nodeIdx--)
 	{
-		for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
-			sideband[nodeIdx].kDopExtents[axisIdx] = bvhvec2( BVH_FAR, -BVH_FAR );
+		for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++) {
+			sideband[nodeIdx].kDopPosExtents[axisIdx] = -BVH_FAR;
+			sideband[nodeIdx].kDopNegExtents[axisIdx] = BVH_FAR;
+		}
 		const typename MBVH8::MBVHNode& currNode = bvh8.mbvhNode[nodeIdx];
 		if (currNode.isLeaf())
 		{
@@ -10869,8 +10872,8 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 					for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
 					{
 						const float projection = tinybvh_dot( proxyKDopAxes[axisIdx], triVerts[vertIdx] );
-						sideband[nodeIdx].kDopExtents[axisIdx].x = tinybvh_min( projection, sideband[nodeIdx].kDopExtents[axisIdx].x );
-						sideband[nodeIdx].kDopExtents[axisIdx].y = tinybvh_max( projection, sideband[nodeIdx].kDopExtents[axisIdx].y );
+						sideband[nodeIdx].kDopNegExtents[axisIdx] = tinybvh_min( projection, sideband[nodeIdx].kDopNegExtents[axisIdx] );
+						sideband[nodeIdx].kDopPosExtents[axisIdx] = tinybvh_max( projection, sideband[nodeIdx].kDopPosExtents[axisIdx] );
 					}
 			}
 			continue;
@@ -10883,8 +10886,8 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 			const Index currChildIdx = currNode.child[childIdx];
 			for (uint32_t axisIdx = 0; axisIdx < DOBB_AXIS_COUNT; axisIdx++)
 			{
-				sideband[nodeIdx].kDopExtents[axisIdx].x = tinybvh_min( sideband[currChildIdx].kDopExtents[axisIdx].x, sideband[nodeIdx].kDopExtents[axisIdx].x );
-				sideband[nodeIdx].kDopExtents[axisIdx].y = tinybvh_max( sideband[currChildIdx].kDopExtents[axisIdx].y, sideband[nodeIdx].kDopExtents[axisIdx].y );
+				sideband[nodeIdx].kDopNegExtents[axisIdx] = tinybvh_min( sideband[currChildIdx].kDopNegExtents[axisIdx], sideband[nodeIdx].kDopNegExtents[axisIdx] );
+				sideband[nodeIdx].kDopPosExtents[axisIdx] = tinybvh_max( sideband[currChildIdx].kDopPosExtents[axisIdx], sideband[nodeIdx].kDopPosExtents[axisIdx] );
 			}
 		}
 		// candidate rotation: that of the child with the largest AABB surface area
@@ -10895,9 +10898,9 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 		{
 			const Index currChildIdx = currNode.child[childIdx];
 			// child AABB from the coordinate axes of its k-DOP
-			const float a = fabsf( sideband[currChildIdx].kDopExtents[0].x - sideband[currChildIdx].kDopExtents[0].y );
-			const float b = fabsf( sideband[currChildIdx].kDopExtents[1].x - sideband[currChildIdx].kDopExtents[1].y );
-			const float c = fabsf( sideband[currChildIdx].kDopExtents[2].x - sideband[currChildIdx].kDopExtents[2].y );
+			const float a = fabsf( sideband[currChildIdx].kDopPosExtents[0] - sideband[currChildIdx].kDopNegExtents[0] );
+			const float b = fabsf( sideband[currChildIdx].kDopPosExtents[1] - sideband[currChildIdx].kDopNegExtents[1] );
+			const float c = fabsf( sideband[currChildIdx].kDopPosExtents[2] - sideband[currChildIdx].kDopNegExtents[2] );
 			const float childAABBSA = 2.0f * (a * b + b * c + c * a);
 			sideband[nodeIdx].AABBSASum += childAABBSA;
 			if (childAABBSA > AABBSAMax) AABBSAMax = childAABBSA, candidateRotationIdx = sideband[currChildIdx].rotation;
@@ -10936,12 +10939,9 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 		const uint8_t candidateRotationIdx = sideband[currBvhIdx].rotation;
 		const DOBB_LUT::Mat3f candidateRotation = lut.GetRawEntry( candidateRotationIdx );
 		const bvhvec3 rotatedAxes[6] = {
-			bvhvec3( candidateRotation.m[0][0], candidateRotation.m[1][0], candidateRotation.m[2][0] ),
-			bvhvec3( -candidateRotation.m[0][0], -candidateRotation.m[1][0], -candidateRotation.m[2][0] ),
-			bvhvec3( candidateRotation.m[0][1], candidateRotation.m[1][1], candidateRotation.m[2][1] ),
-			bvhvec3( -candidateRotation.m[0][1], -candidateRotation.m[1][1], -candidateRotation.m[2][1] ),
-			bvhvec3( candidateRotation.m[0][2], candidateRotation.m[1][2], candidateRotation.m[2][2] ),
-			bvhvec3( -candidateRotation.m[0][2], -candidateRotation.m[1][2], -candidateRotation.m[2][2] )
+			candidateRotation.Column( 0 ), -candidateRotation.Column( 0 ),
+			candidateRotation.Column( 1 ), -candidateRotation.Column( 1 ),
+			candidateRotation.Column( 2 ), -candidateRotation.Column( 2 )
 		};
 		float rotatedAxesExtents[6];
 		bool hasLeafSlot = false;
@@ -10954,22 +10954,24 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 			// reproject the child's k-DOP onto each signed axis of the candidate frame
 			for (uint32_t rotatedAxesIdx = 0; rotatedAxesIdx < 6; rotatedAxesIdx++)
 			{
-				const DOBB_LUT::ReprojectionEntry& reprojection = lut.reprojections[candidateRotationIdx][rotatedAxesIdx];
+				const DOBB_LUT::ReprojectionEntry& reprojection = lut.reprojectionLUT[candidateRotationIdx][rotatedAxesIdx];
 				// normals of the selected planes
 				const bvhvec3 v0 = proxyKDopAxes[reprojection.axisIdx[0]] * (float)reprojection.sign[0];
 				const bvhvec3 v1 = proxyKDopAxes[reprojection.axisIdx[1]] * (float)reprojection.sign[1];
 				const bvhvec3 v2 = proxyKDopAxes[reprojection.axisIdx[2]] * (float)reprojection.sign[2];
 				// distances of the selected planes
-				const bvhvec2* childExtents = sideband[currChildIdx].kDopExtents;
-				const float h0 = reprojection.sign[0] == 1 ? childExtents[reprojection.axisIdx[0]].y : -childExtents[reprojection.axisIdx[0]].x;
-				const float h1 = reprojection.sign[1] == 1 ? childExtents[reprojection.axisIdx[1]].y : -childExtents[reprojection.axisIdx[1]].x;
-				const float h2 = reprojection.sign[2] == 1 ? childExtents[reprojection.axisIdx[2]].y : -childExtents[reprojection.axisIdx[2]].x;
+				const float* childNegExtents = sideband[currChildIdx].kDopNegExtents;
+				const float* childPosExtents = sideband[currChildIdx].kDopPosExtents;
+				const float h0 = reprojection.sign[0] == 1 ? childPosExtents[reprojection.axisIdx[0]] : -childNegExtents[reprojection.axisIdx[0]];
+				const float h1 = reprojection.sign[1] == 1 ? childPosExtents[reprojection.axisIdx[1]] : -childNegExtents[reprojection.axisIdx[1]];
+				const float h2 = reprojection.sign[2] == 1 ? childPosExtents[reprojection.axisIdx[2]] : -childNegExtents[reprojection.axisIdx[2]];
 				// apex point: intersection of the three planes
 				const bvhvec3 c0 = tinybvh_cross( v1, v2 );
 				const bvhvec3 apexPoint = (c0 * h0 + tinybvh_cross( v2, v0 ) * h1 + tinybvh_cross( v0, v1 ) * h2) / tinybvh_dot( v0, c0 );
 				// axis extent: projection of the apex point onto the axis
 				rotatedAxesExtents[rotatedAxesIdx] = tinybvh_dot( rotatedAxes[rotatedAxesIdx], apexPoint );
 			}
+			// rotatedAxesExtents: even = extent along +axis (max), odd = extent along -axis (-min)
 			childMinPoint[childIdx] = bvhvec3( -rotatedAxesExtents[1], -rotatedAxesExtents[3], -rotatedAxesExtents[5] );
 			childMaxPoint[childIdx] = bvhvec3( rotatedAxesExtents[0], rotatedAxesExtents[2], rotatedAxesExtents[4] );
 			const float a = childMaxPoint[childIdx].x - childMinPoint[childIdx].x;
@@ -10986,9 +10988,10 @@ TEMPLATED void BVH_DOBB<Float, Index>::ConvertFrom( const MBVH8& original )
 			chosenRotation = DOBB_AABB_ROTATION;
 			for (uint32_t childIdx = 0; childIdx < currBvhNode.childCount; childIdx++)
 			{
-				const bvhvec2* childExtents = sideband[currBvhNode.child[childIdx]].kDopExtents;
-				childMinPoint[childIdx] = bvhvec3( childExtents[0].x, childExtents[1].x, childExtents[2].x );
-				childMaxPoint[childIdx] = bvhvec3( childExtents[0].y, childExtents[1].y, childExtents[2].y );
+				const float* childNegExtents = sideband[currBvhNode.child[childIdx]].kDopNegExtents;
+				const float* childPosExtents = sideband[currBvhNode.child[childIdx]].kDopPosExtents;
+				childMinPoint[childIdx] = bvhvec3( childNegExtents[0], childNegExtents[1], childNegExtents[2] );
+				childMaxPoint[childIdx] = bvhvec3( childPosExtents[0], childPosExtents[1], childPosExtents[2] );
 			}
 		}
 		// quantization frame: union of the child boxes
@@ -11095,9 +11098,9 @@ TEMPLATED int32_t BVH_DOBB<Float, Index>::Intersect( Ray& ray ) const
 		if (rotationIdx != DOBB_AABB_ROTATION)
 		{
 			const DOBB_LUT::Mat3f rotation = GetLUT().GetRawEntry( rotationIdx );
-			const Vec3 rotationX( rotation.m[0][0], rotation.m[1][0], rotation.m[2][0] );
-			const Vec3 rotationY( rotation.m[0][1], rotation.m[1][1], rotation.m[2][1] );
-			const Vec3 rotationZ( rotation.m[0][2], rotation.m[1][2], rotation.m[2][2] );
+			const Vec3 rotationX = rotation.Column( 0 );
+			const Vec3 rotationY = rotation.Column( 1 );
+			const Vec3 rotationZ = rotation.Column( 2 );
 			localRay.O = Vec3( tinybvh_dot( rotationX, ray.O ), tinybvh_dot( rotationY, ray.O ), tinybvh_dot( rotationZ, ray.O ) );
 			localRay.D = Vec3( tinybvh_dot( rotationX, ray.D ), tinybvh_dot( rotationY, ray.D ), tinybvh_dot( rotationZ, ray.D ) );
 		}
@@ -11165,9 +11168,9 @@ TEMPLATED bool BVH_DOBB<Float, Index>::IsOccluded( const Ray& ray ) const
 		if (rotationIdx != DOBB_AABB_ROTATION)
 		{
 			const DOBB_LUT::Mat3f rotation = GetLUT().GetRawEntry( rotationIdx );
-			const Vec3 rotationX( rotation.m[0][0], rotation.m[1][0], rotation.m[2][0] );
-			const Vec3 rotationY( rotation.m[0][1], rotation.m[1][1], rotation.m[2][1] );
-			const Vec3 rotationZ( rotation.m[0][2], rotation.m[1][2], rotation.m[2][2] );
+			const Vec3 rotationX = rotation.Column( 0 );
+			const Vec3 rotationY = rotation.Column( 1 );
+			const Vec3 rotationZ = rotation.Column( 2 );
 			localRay.O = Vec3( tinybvh_dot( rotationX, ray.O ), tinybvh_dot( rotationY, ray.O ), tinybvh_dot( rotationZ, ray.O ) );
 			localRay.D = Vec3( tinybvh_dot( rotationX, ray.D ), tinybvh_dot( rotationY, ray.D ), tinybvh_dot( rotationZ, ray.D ) );
 		}
