@@ -29,13 +29,17 @@ enum Phase {
 };
 
 enum RenderOption {
+	SHADED,
 	HEATMAP,
+	PATHCOST_RGB,
 	LEAFXRAY
 };
 
 // Render options and helpers
-static RenderOption renderOption = LEAFXRAY;
-static const bvhvec3 leafHitColor(0.01f, 0.02f, 0.04f);
+static RenderOption renderOption = HEATMAP;
+static const bvhvec3 xrayTint(0.0f, 0.56f, 0.07f);
+static const float xrayDensity = 0.01f;   // per leaf box; brightness = 1 - exp(-density * count)
+static float heatmapMaxSteps = 256.0f;
 
 // For instrumentation for experiment
 struct TraversalStats {
@@ -43,16 +47,35 @@ struct TraversalStats {
 	uint64_t nodeVisits = 0;
 	uint64_t boxTests = 0;
 	uint64_t triTests = 0;
+	uint64_t leafHits = 0;
 
-	void add(const TraversalStats& other) {
+	TraversalStats& operator+=(const TraversalStats& other) {
 		rayCount += other.rayCount;
 		nodeVisits += other.nodeVisits;
 		boxTests += other.boxTests;
 		triTests += other.triTests;
+		leafHits += other.leafHits;
+		return *this;
+	}
+
+	TraversalStats operator+(const TraversalStats& other) const {
+		TraversalStats sum = *this;
+		sum += other;
+		return sum;
+	}
+
+	TraversalStats operator-(const TraversalStats& other) const {
+		TraversalStats diff;
+		diff.rayCount = rayCount - other.rayCount;
+		diff.nodeVisits = nodeVisits - other.nodeVisits;
+		diff.boxTests = boxTests - other.boxTests;
+		diff.triTests = triTests - other.triTests;
+		diff.leafHits = leafHits - other.leafHits;
+		return diff;
 	}
 
 	void reset() {
-		rayCount = 0; nodeVisits = 0; boxTests = 0; triTests = 0;
+		rayCount = 0; nodeVisits = 0; boxTests = 0; triTests = 0; leafHits = 0;
 	}
 
 	void print(const char* statName) {
@@ -94,17 +117,18 @@ static int viewPointIdx = 0;
 struct SceneSetup {
 	const char* sceneName;
 	float viewPointScale = 1.0f;
+	float heatmapMaxSteps = 256.0f;
 	const char* meshPath[2];
 	bvhvec3 eye, view;
 };
 
 static const SceneSetup scenes[] = {
-	{"HAIRBALL",		1.0f,  {"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
-	{"BISTRO_EXTERIOR", 0.2f,  {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
-	{"WHITE_OAK",		1.0f,  {"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
-	{"POWERPLANT",		0.15f, {"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
-	{"DRAGON",			1.0f,  {"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
-	{"CRYTEKSPONZA",	0.15f, {"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
+	{"HAIRBALL",		0.8f,  36.0f, {"./testdata/hairball.bin", nullptr}, bvhvec3(0.0f, 0.0f, -10.0f),    bvhvec3(0.0f, 0.0f, 1.0f)},
+	{"BISTRO_EXTERIOR", 0.2f,  24.0f, {"./testdata/bistro_ext_part1.bin", "./testdata/bistro_ext_part2.bin"}, bvhvec3(-24.2f, -8.2f, -2.0f),  bvhvec3(10.65f, -0.06f, 0.26f)},
+	{"WHITE_OAK",		1.0f,  16.0f, {"./testdata/white_oak.bin", nullptr},		  bvhvec3(0.34f, 3.3f, -7.0f),   bvhvec3(0.0f, 0.0f, 1.0f)},
+	{"POWERPLANT",		0.15f, 36.0f, {"./testdata/powerplant.bin", nullptr}, bvhvec3(-57000.0f, 103000.0f, -40000.0f), bvhvec3(0.26f, -0.6f, 0.76f)},
+	{"DRAGON",			1.0f,  11.0f, {"./testdata/dragon_scene.bin", nullptr}, bvhvec3(15.7f, 6.2f, 14.5f), bvhvec3(-0.731f, -0.105f, -0.674f)},
+	{"CRYTEKSPONZA",	0.15f, 36.0f, {"./testdata/cryteksponza.bin", nullptr}, bvhvec3(-15.24f, 21.5f, 2.54f), bvhvec3(0.826f, -0.438f, -0.356f)}
 };
 static const int sceneCount = sizeof(scenes) / sizeof(scenes[0]);
 static int sceneIdx = 0;
@@ -305,6 +329,15 @@ void printDOBBSAHAndStats(const char* tableName) {
 	std::cout.precision(previousPrecision);
 }
 
+bvhvec3 heat(float t)
+{
+	float r = 0.1357f + t * (4.5974f + t * (-42.3277f + t * (130.5887f + t * (-150.5666f + t * 58.1375f))));
+	float g = 0.0914f + t * (2.1856f + t * (4.8052f + t * (-14.0195f + t * (4.2109f + t * 2.7747f))));
+	float b = 0.1067f + t * (12.5925f + t * (-60.1097f + t * (109.0745f + t * (-88.5066f + t * 26.8183f))));
+	r = r < 0 ? 0 : (r > 1 ? 1 : r); g = g < 0 ? 0 : (g > 1 ? 1 : g); b = b < 0 ? 0 : (b > 1 ? 1 : b);
+	return bvhvec3(r, g, b);
+}
+
 // Same signature and behaviour as BVHBase::IntersectTri (Möller–Trumbore, no opacity maps)
 static void IntersectTri(Ray& ray, const uint32_t triIdx, const bvhvec4slice& verts,
 	const uint32_t i0, const uint32_t i1, const uint32_t i2)
@@ -347,10 +380,8 @@ static bool TriOccludes(const Ray& ray, const bvhvec4slice& verts, const uint32_
 }
 
 // Copy of DOBB Intersect with instrumentation
-uint32_t IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* stats = nullptr) {
+void IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats* stats = nullptr, const bool countAllLeaves = false) {
 	if (stats) stats->rayCount++;
-
-	uint32_t numberOfLeafHits = 0;
 
 	BVH_DOBB::StackEntry nodeStack[512]; uint32_t stackIdx = 0;
 	nodeStack[stackIdx++] = { 0, -BVH_FAR };
@@ -417,19 +448,20 @@ uint32_t IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats*
 			if (currNode.iMask & (1u << slot)) continue;
 			if (slotDistance[slot] >= ray.hit.t) break;   // sorted: all remaining are farther
 
-			numberOfLeafHits++;
+			if (stats) stats->leafHits++;
+			if (!countAllLeaves) {
+				// Intersect triangles
+				const uint32_t firstTri = currNode.triBaseIndex + (currNode.meta[slot] & 31);
+				const uint32_t triCount = tinybvh_popc(currNode.meta[slot] >> 5);
 
-			// Intersect triangles
-			const uint32_t firstTri = currNode.triBaseIndex + (currNode.meta[slot] & 31);
-			const uint32_t triCount = tinybvh_popc(currNode.meta[slot] >> 5);
+				uint32_t i0, i1, i2;
+				for (uint32_t triIdx = 0; triIdx < triCount; triIdx++) {
+					if (stats) stats->triTests++;
 
-			uint32_t i0, i1, i2;
-			for (uint32_t triIdx = 0; triIdx < triCount; triIdx++) {
-				if (stats) stats->triTests++;
-
-				const uint32_t primIdx = bvh.dobbPrimIdx[firstTri + triIdx];
-				GET_PRIM_INDICES_I0_I1_I2(bvh.bvh8.bvh, primIdx);
-				IntersectTri(ray, primIdx, bvh.bvh8.bvh.verts, i0, i1, i2);
+					const uint32_t primIdx = bvh.dobbPrimIdx[firstTri + triIdx];
+					GET_PRIM_INDICES_I0_I1_I2(bvh.bvh8.bvh, primIdx);
+					IntersectTri(ray, primIdx, bvh.bvh8.bvh.verts, i0, i1, i2);
+				}
 			}
 		}
 
@@ -446,8 +478,6 @@ uint32_t IntersectionInstrumented(const BVH_DOBB& bvh, Ray& ray, TraversalStats*
 			};
 		}
 	}
-
-	return numberOfLeafHits;
 }
 
 // Copy of DOBB isOccluded with instrumentation
@@ -542,10 +572,8 @@ bool isOccludedInstrumented(const BVH_DOBB& bvh, const Ray& ray, TraversalStats*
 }
 
 // MBVH Intersect matching with DOBB processing order
-uint32_t IntersectionInstrumented(const MBVH<8>& bvh8, Ray& ray, TraversalStats* stats) {
+void IntersectionInstrumented(const MBVH<8>& bvh8, Ray& ray, TraversalStats* stats = nullptr, const bool countAllLeaves = false) {
 	if (stats) stats->rayCount++;
-
-	uint32_t numberOfLeafHits = 0;
 
 	BVH_DOBB::StackEntry nodeStack[512];
 	uint32_t stackIdx = 0;
@@ -558,15 +586,16 @@ uint32_t IntersectionInstrumented(const MBVH<8>& bvh8, Ray& ray, TraversalStats*
 		const MBVH<8>::MBVHNode& currNode = bvh8.mbvhNode[entry.nodeIdx];
 
 		if (currNode.isLeaf()) {
-			numberOfLeafHits++;
+			if (stats) stats->leafHits++;
+			if (!countAllLeaves) {
+				uint32_t i0, i1, i2;
+				for (uint32_t triOffset = 0; triOffset < currNode.triCount; triOffset++) {
+					if (stats) stats->triTests++;
 
-			uint32_t i0, i1, i2;
-			for (uint32_t triOffset = 0; triOffset < currNode.triCount; triOffset++) {
-				if (stats) stats->triTests++;
-
-				const uint32_t primIdx = bvh8.bvh.primIdx[currNode.firstTri + triOffset];
-				GET_PRIM_INDICES_I0_I1_I2(bvh8.bvh, primIdx);
-				IntersectTri(ray, primIdx, bvh8.bvh.verts, i0, i1, i2);
+					const uint32_t primIdx = bvh8.bvh.primIdx[currNode.firstTri + triOffset];
+					GET_PRIM_INDICES_I0_I1_I2(bvh8.bvh, primIdx);
+					IntersectTri(ray, primIdx, bvh8.bvh.verts, i0, i1, i2);
+				}
 			}
 		}
 		else {
@@ -608,8 +637,6 @@ uint32_t IntersectionInstrumented(const MBVH<8>& bvh8, Ray& ray, TraversalStats*
 			}
 		}
 	}
-
-	return numberOfLeafHits;
 }
 
 // MBVH isOccluded matching with DOBB processing order
@@ -668,7 +695,7 @@ void printStats(const char* tableName) {
 	std::cout << std::fixed << std::setprecision(3);
 
 	TraversalStats allStats;
-	allStats.add(primHitStats); allStats.add(secondHitStats); allStats.add(shadowStats);
+	allStats += primHitStats; allStats += secondHitStats; allStats += shadowStats;
 
 	// Guards against division by 0
 	const double guardedPrimRayCount = primHitStats.rayCount ? (double)primHitStats.rayCount : 1.0f;
@@ -748,14 +775,11 @@ template <class BVHType>
 bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost, 
 	TraversalStats& threadPrimHitStats, TraversalStats& threadSecondHitStats, TraversalStats& threadShadowStats, unsigned depth = 0)
 {
-	uint32_t numberOfLeafHits = 0;
 	// find primary intersection
-	if (depth == 0) numberOfLeafHits = IntersectionInstrumented(bvh, ray, &threadPrimHitStats);
+	if (depth == 0) IntersectionInstrumented(bvh, ray, &threadPrimHitStats);
 	else			IntersectionInstrumented(bvh, ray, &threadSecondHitStats);
 	// shade
-	if (ray.hit.t == 1e30f)
-		if (renderOption == HEATMAP) return bvhvec3(0.6f, 0.7f, 1); // hit nothing
-		else return leafHitColor * (float)numberOfLeafHits;
+	if (ray.hit.t == 1e30f) return bvhvec3(0.6f, 0.7f, 1);
 	bvhvec3 I = ray.O + ray.hit.t * ray.D;
 	bvhvec3 N = TriangleNormal(ray.hit.prim);
 	if (tinybvh_dot(N, ray.D) > 0) N = -N;
@@ -778,10 +802,7 @@ bvhvec3 Trace(const BVHType& bvh, Ray ray, unsigned& seed, uint64_t& traceCost,
 		indirect = BRDF * irradiance * (1.0f / pdf);
 	}
 	// finalize
-	if (renderOption == HEATMAP)
-		return direct + indirect;
-	else
-		return leafHitColor * (float)numberOfLeafHits;
+	return direct + indirect;
 }
 
 template <class BVHType>
@@ -806,32 +827,50 @@ void TraceWorkerThread(const BVHType& bvh, uint32_t* buf, float scale, int threa
 			// trace
 			const TraversalStats primHitBefore = threadPrimHitStats, secondHitBefore = threadSecondHitStats, shadowBefore = threadShadowStats;
 			const bvhvec3 traceResult = Trace(bvh, Ray(cam.eye, D), seed, localCost, threadPrimHitStats, threadSecondHitStats, threadShadowStats);
-			if (renderOption == HEATMAP) {
-				// red: total node visits; green: total triangle tests; blue: total box tests
-				accumulator[pixelIdx] += bvhvec3(
-					nodeVisitScale *
-					((threadPrimHitStats.nodeVisits - primHitBefore.nodeVisits) +
-						(threadSecondHitStats.nodeVisits - secondHitBefore.nodeVisits) +
-						(threadShadowStats.nodeVisits - shadowBefore.nodeVisits)),
-					triTestScale *
-					((threadPrimHitStats.triTests - primHitBefore.triTests) +
-						(threadSecondHitStats.triTests - secondHitBefore.triTests) +
-						(threadShadowStats.triTests - shadowBefore.triTests)),
-					boxTestScale *
-					((threadPrimHitStats.boxTests - primHitBefore.boxTests) +
-						(threadSecondHitStats.boxTests - secondHitBefore.boxTests) +
-						(threadShadowStats.boxTests - shadowBefore.boxTests))
-				);
-			}
-			else {
-				accumulator[pixelIdx] += traceResult;
+			switch (renderOption) {
+				case SHADED: {
+					accumulator[pixelIdx] += traceResult;
+					break;
+				}
+				case HEATMAP: {
+					const TraversalStats primaryStats = threadPrimHitStats - primHitBefore;
+					accumulator[pixelIdx] += bvhvec3((float)primaryStats.nodeVisits);
+					break;
+				}
+				case PATHCOST_RGB: {
+					const TraversalStats pixelStats = (threadPrimHitStats - primHitBefore)
+						+ (threadSecondHitStats - secondHitBefore)
+						+ (threadShadowStats - shadowBefore);
+					// red: total node visits; green: total triangle tests; blue: total box tests
+					accumulator[pixelIdx] += bvhvec3(
+						nodeVisitScale * pixelStats.nodeVisits,
+						triTestScale * pixelStats.triTests,
+						boxTestScale * pixelStats.boxTests
+					);
+					break;
+				}
+				case LEAFXRAY: {
+					TraversalStats xrayStats; Ray xrayRay(cam.eye, D);
+					IntersectionInstrumented(bvh, xrayRay, &xrayStats, true);
+					accumulator[pixelIdx] += bvhvec3((float)xrayStats.leafHits); // raw count, mapped to a colour below
+					break;
+				}
+				default: break;
 			}
 			
-			const bvhvec3 E = accumulator[pixelIdx] * scale;
+			// finalize
+			const bvhvec3 averaged = accumulator[pixelIdx] * scale;
+			bvhvec3 displayColour;
+			if (renderOption == LEAFXRAY) 
+				displayColour = xrayTint * (1.0f - expf(-xrayDensity * averaged.x));
+			else if (renderOption == HEATMAP)
+				displayColour = heat(tinybvh_min(1.0f, averaged.x / scenes[sceneIdx].heatmapMaxSteps));
+			else					      
+				displayColour = bvhvec3(sqrtf(averaged.x), sqrtf(averaged.y), sqrtf(averaged.z));
 			// visualize, with a poor man's gamma correct
-			const int r = (int)tinybvh_min(255.0f, sqrtf(E.x) * 255.0f);
-			const int g = (int)tinybvh_min(255.0f, sqrtf(E.y) * 255.0f);
-			const int b = (int)tinybvh_min(255.0f, sqrtf(E.z) * 255.0f);
+			const int r = (int)tinybvh_min(255.0f, displayColour.x * 255.0f);
+			const int g = (int)tinybvh_min(255.0f, displayColour.y * 255.0f);
+			const int b = (int)tinybvh_min(255.0f, displayColour.z * 255.0f);
 			buf[pixelIdx] = b + (g << 8) + (r << 16);
 		}
 		tile = tileIdx++;
@@ -1012,8 +1051,11 @@ void RenderTick(const BVHType& bvh, float delta_time_s, fenster& f, uint32_t* bu
 		threads.emplace_back(TraceWorkerThread<BVHType>, std::cref(bvh), buf, scale, i,
 			std::ref(threadPrimHitStats[i]), std::ref(threadSecondHitStats[i]), std::ref(threadShadowStats[i]));
 	for (auto& thread : threads) thread.join();
-	for (uint32_t i = 0; i < threadCount; i++)
-		primHitStats.add(threadPrimHitStats[i]), secondHitStats.add(threadSecondHitStats[i]), shadowStats.add(threadShadowStats[i]);
+	for (uint32_t i = 0; i < threadCount; i++) {
+		primHitStats += threadPrimHitStats[i];
+		secondHitStats += threadSecondHitStats[i];
+		shadowStats += threadShadowStats[i];
+	}
 	// Create title
 	const char* bvhName = "-";
 	if (phase == RENDERDOBB) bvhName = "DOBB BVH";
